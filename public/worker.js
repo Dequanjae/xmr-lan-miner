@@ -70,32 +70,40 @@ function meetsTarget(hashBuf, targetHex) {
 }
 
 async function mineLoop() {
+  // Pre-allocate reusable hash buffer — avoids GC pressure from HEAPU8.slice() per hash
+  const hashView = new Uint8Array(M.HEAPU8.buffer, outPtr, 32);
+
   while (mining) {
     if (!currentJob || !M) { await new Promise(r => setTimeout(r, 100)); continue; }
     const job = currentJob;
     const blob = hexToU8(job.blob);
     if (blob.length > IN_MAX) { post('error', { message: 'blob too large' }); mining = false; break; }
 
+    // Pre-write blob once — only nonce changes per hash
+    M.HEAPU8.set(blob, inPtr);
     const t0 = Date.now();
     let hashes = 0;
+    const batchMs = 2000; // 2s batches — less yield overhead than 500ms
 
-    while (Date.now() - t0 < 500 && mining && currentJob === job) {
+    while (Date.now() - t0 < batchMs && mining && currentJob === job) {
       if (nonceCur >= nonceEnd) nonceCur = nonceStart;
-      blob[39] = nonceCur & 0xff;
-      blob[40] = (nonceCur >>> 8) & 0xff;
-      blob[41] = (nonceCur >>> 16) & 0xff;
-      blob[42] = (nonceCur >>> 24) & 0xff;
+      // Write 4-byte nonce in one shot via HEAPU32 (offset 39 = 9.75 bytes, need byte writes)
+      M.HEAPU8[inPtr + 39] = nonceCur & 0xff;
+      M.HEAPU8[inPtr + 40] = (nonceCur >>> 8) & 0xff;
+      M.HEAPU8[inPtr + 41] = (nonceCur >>> 16) & 0xff;
+      M.HEAPU8[inPtr + 42] = (nonceCur >>> 24) & 0xff;
 
-      M.HEAPU8.set(blob, inPtr);
       M._rx_calculate_hash(inPtr, blob.length, outPtr);
       hashes++;
 
-      const hash = M.HEAPU8.slice(outPtr, outPtr + 32);
-      if (meetsTarget(hash, job.target)) {
+      // Read hash directly from HEAPU8 — no new allocation
+      if (meetsTarget(hashView, job.target)) {
+        // Copy hash for the share message (rare, so allocation is fine here)
+        const hashCopy = new Uint8Array(hashView);
         post('share', {
           jobId: job.job_id,
           nonce: nonceCur.toString(16).padStart(8, '0'),
-          result: bufToHex(hash),
+          result: bufToHex(hashCopy),
         });
       }
       nonceCur = (nonceCur + 1) >>> 0;

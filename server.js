@@ -21,6 +21,11 @@ const MIME = {
 const miners = new Map(); // tag -> { tag, ip, wallet, worker, sysInfo, hashrate, workers, accepted, rejected, connectedAt, lastSeen }
 
 const server = http.createServer((req, res) => {
+  // Cross-origin isolation headers — enables SharedArrayBuffer for WASM threads
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/') p = '/index.html';
   if (p === '/admin' || p === '/admin/') p = '/admin.html';
