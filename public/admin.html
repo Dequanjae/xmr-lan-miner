@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XMR LAN Miner — Admin</title>
+<style>
+  * { box-sizing: border-box; font-family: ui-monospace, Menlo, monospace; }
+  body { background: #0a0a0a; color: #d0d0d0; margin: 0; padding: 2rem; }
+  .container { max-width: 1100px; margin: 0 auto; }
+  h1 { color: #ff6600; letter-spacing: 2px; }
+  .head { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; padding-bottom: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap; gap: 1rem; }
+  .stats-bar { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+  .stat-card { background: #111; border: 1px solid #222; padding: 0.75rem 1.25rem; border-radius: 4px; }
+  .stat-card .label { color: #888; font-size: 11px; text-transform: uppercase; }
+  .stat-card .value { font-size: 24px; font-weight: bold; margin-top: 0.25rem; }
+  .total-hash { color: #4caf50; }
+  .total-miners { color: #2196f3; }
+  .total-shares { color: #ff6600; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.6rem 0.75rem; border-bottom: 1px solid #1a1a1a; font-size: 13px; }
+  th { color: #888; text-transform: uppercase; font-size: 11px; }
+  tr:hover { background: #111; }
+  .hashrate { color: #4caf50; font-weight: bold; }
+  .accepted { color: #2196f3; }
+  .rejected { color: #e74c3c; }
+  .sys-info { color: #888; font-size: 11px; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot-green { background: #4caf50; }
+  .dot-red { background: #e74c3c; }
+  .actions { display: flex; gap: 0.5rem; }
+  button { background: #ff6600; color: #000; border: none; padding: 0.5rem 1rem; font-weight: bold; cursor: pointer; border-radius: 4px; font-size: 13px; }
+  button:hover { background: #ff8833; }
+  button.sec { background: #333; color: #e0e0e0; }
+  button.sec:hover { background: #444; }
+  input { background: #1a1a1a; border: 1px solid #333; color: #e0e0e0; padding: 0.5rem; border-radius: 4px; width: 100%; font-size: 13px; }
+  .no-miners { text-align: center; padding: 3rem; color: #555; }
+  a { color: #ff6600; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="head">
+    <h1>[ ADMIN DASHBOARD ]</h1>
+    <div class="actions">
+      <a href="/"><button class="sec">Miner Page</button></a>
+      <button onclick="refresh()">Refresh</button>
+      <button class="sec" onclick="toggleAuto()">Auto: <span id="autoState">ON</span></button>
+    </div>
+  </div>
+
+  <div class="stats-bar">
+    <div class="stat-card"><div class="label">Total Hashrate</div><div class="value total-hash" id="totalHash">0 H/s</div></div>
+    <div class="stat-card"><div class="label">Active Miners</div><div class="value total-miners" id="totalMiners">0</div></div>
+    <div class="stat-card"><div class="label">Total Shares</div><div class="value total-shares" id="totalShares">0</div></div>
+    <div class="stat-card"><div class="label">Pool</div><div class="value" style="font-size:14px" id="poolInfo">—</div></div>
+  </div>
+
+  <table id="minerTable">
+    <thead>
+      <tr>
+        <th>Status</th><th>Worker</th><th>IP</th><th>Hashrate</th><th>Workers</th><th>Accepted</th><th>Rejected</th><th>System</th><th>Wallet</th><th>Uptime</th>
+      </tr>
+    </thead>
+    <tbody id="minerBody"></tbody>
+  </table>
+  <div id="emptyMsg" class="no-miners">No miners connected. Open <a href="/">/</a> on a device to start mining.</div>
+</div>
+<script>
+let autoRefresh = true;
+let intervalId = null;
+
+async function refresh() {
+  try {
+    const [cfgR, minersR] = await Promise.all([fetch('/config'), fetch('/api/miners')]);
+    const cfg = await cfgR.json();
+    const miners = await minersR.json();
+
+    $('poolInfo').textContent = `${cfg.poolHost}:${cfg.poolPort}`;
+
+    let totalHash = 0, totalShares = 0;
+    miners.forEach(m => { totalHash += m.hashrate || 0; totalShares += (m.accepted || 0) + (m.rejected || 0); });
+    $('totalHash').textContent = totalHash.toLocaleString() + ' H/s';
+    $('totalMiners').textContent = miners.length;
+    $('totalShares').textContent = totalShares;
+
+    const body = $('minerBody');
+    body.innerHTML = '';
+    $('emptyMsg').style.display = miners.length === 0 ? 'block' : 'none';
+
+    miners.forEach(m => {
+      const uptime = m.connectedAt ? formatUptime(Date.now() - m.connectedAt) : '—';
+      const sys = m.sysInfo ? `${m.sysInfo.os}/${m.sysInfo.browser} ${m.sysInfo.cores}c ${m.sysInfo.ram}` : '—';
+      const sinceLastSeen = Date.now() - (m.lastSeen || 0);
+      const alive = sinceLastSeen < 30000;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><span class="status-dot ${alive ? 'dot-green' : 'dot-red'}"></span>${alive ? 'live' : 'stale'}</td>
+        <td>${m.worker || '—'}</td>
+        <td>${m.ip || '—'}</td>
+        <td class="hashrate">${(m.hashrate || 0).toLocaleString()} H/s</td>
+        <td>${m.workers || 0}</td>
+        <td class="accepted">${m.accepted || 0}</td>
+        <td class="rejected">${m.rejected || 0}</td>
+        <td class="sys-info">${sys}</td>
+        <td style="font-size:10px;color:#666">${(m.wallet || '').slice(0,10)}...${(m.wallet || '').slice(-4)}</td>
+        <td>${uptime}</td>
+      `;
+      body.appendChild(tr);
+    });
+  } catch (e) { console.error(e); }
+}
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+}
+
+function toggleAuto() {
+  autoRefresh = !autoRefresh;
+  $('autoState').textContent = autoRefresh ? 'ON' : 'OFF';
+  if (autoRefresh) startAuto(); else stopAuto();
+}
+function startAuto() { if (!intervalId) intervalId = setInterval(refresh, 2000); }
+function stopAuto() { if (intervalId) { clearInterval(intervalId); intervalId = null; } }
+
+function $(id) { return document.getElementById(id); }
+
+refresh();
+startAuto();
+</script>
+</body>
+</html>

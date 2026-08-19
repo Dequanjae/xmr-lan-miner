@@ -1,5 +1,4 @@
-// Stratum TCP bridge + static file server for LAN XMR mining
-// Any device on the network hits http://NAS:8080, browser hashes RandomX, shares flow through here.
+// Stratum TCP bridge + static file server + admin dashboard for LAN XMR mining
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -18,14 +17,22 @@ const MIME = {
   '.wasm': 'application/wasm', '.css': 'text/css', '.json': 'application/json',
 };
 
+// Active miner registry for admin dashboard
+const miners = new Map(); // tag -> { tag, ip, wallet, worker, sysInfo, hashrate, workers, accepted, rejected, connectedAt, lastSeen }
+
 const server = http.createServer((req, res) => {
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/') p = '/index.html';
+  if (p === '/admin' || p === '/admin/') p = '/admin.html';
   if (p === '/config') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({
       wallet: WALLET, poolHost: POOL_HOST, poolPort: POOL_PORT, workerPrefix: WORKER_PREFIX,
     }));
+  }
+  if (p === '/api/miners') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify(Array.from(miners.values())));
   }
   const file = path.join(PUBLIC, p);
   if (!file.startsWith(PUBLIC)) { res.writeHead(403); return res.end(); }
@@ -38,33 +45,20 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-// Hex helpers
 const hexToBuf = (h) => Buffer.from(h, 'hex');
-const bufToHex = (b) => Buffer.from(b).toString('hex');
-
-// Stratum target → 256-bit integer difficulty for compare
-// Pool sends target as hex string; usually 8-byte LE (CryptoNote style) or 4-byte compact
-function targetToBigInt(targetHex) {
-  const buf = hexToBuf(targetHex);
-  if (buf.length === 4) {
-    // 4-byte compact: diff1 base is 0xffff*2^208 style
-    const t = buf.readUInt32LE(0);
-    if (t === 0) return 0n;
-    // diff = (2^64 - 1) / ((2^32 - 1) / t) — from your original code, kept compatible
-    return 0xffffffffffffffffn / (0xffffffffn / BigInt(t));
-  } else if (buf.length === 8) {
-    return buf.readBigUInt64LE(0);
-  } else if (buf.length === 32) {
-    // 256-bit target LE — read the last 8 bytes as the effective target per RandomX convention
-    return buf.readBigUInt64LE(24);
-  }
-  return 0n;
-}
 
 wss.on('connection', (ws, req) => {
-  const clientIp = req.socket.remoteAddress;
-  const tag = `client-${Math.random().toString(36).slice(2, 6)}`;
+  const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  const tag = `miner-${Math.random().toString(36).slice(2, 6)}`;
   console.log(`[${tag}] connected from ${clientIp}`);
+
+  // Register in admin registry
+  const minerRecord = {
+    tag, ip: clientIp, wallet: WALLET, worker: `${WORKER_PREFIX}-${tag}`,
+    sysInfo: null, hashrate: 0, workers: 0, accepted: 0, rejected: 0,
+    connectedAt: Date.now(), lastSeen: Date.now(),
+  };
+  miners.set(tag, minerRecord);
 
   let pool = null;
   let poolBuf = '';
@@ -80,10 +74,7 @@ wss.on('connection', (ws, req) => {
     if (poolReady && pool && !pool.destroyed) pool.write(line);
     else pending.push(line);
   };
-
-  const safeSend = (obj) => {
-    try { ws.send(JSON.stringify(obj)); } catch (e) {}
-  };
+  const safeSend = (obj) => { try { ws.send(JSON.stringify(obj)); } catch (e) {} };
 
   const connectPool = () => {
     if (pool && !pool.destroyed) try { pool.destroy(); } catch (e) {}
@@ -92,15 +83,9 @@ wss.on('connection', (ws, req) => {
     pool.connect(poolPort, poolHost, () => {
       console.log(`[${tag}] pool connected ${poolHost}:${poolPort}`);
       poolReady = true;
-      // send login
       sendPool({
         id: 1, jsonrpc: '2.0', method: 'login',
-        params: {
-          login: wallet,
-          pass: workerName,
-          agent: 'xmr-lan-miner/1.0',
-          algo: ['rx/0'],
-        },
+        params: { login: wallet, pass: workerName, agent: 'xmr-lan-miner/1.0', algo: ['rx/0'] },
       });
       for (const l of pending) pool.write(l);
       pending = [];
@@ -115,13 +100,15 @@ wss.on('connection', (ws, req) => {
           const msg = JSON.parse(line);
           if (msg.method === 'job' || (msg.result && msg.result.job)) {
             const job = msg.result?.job || msg.params;
-            console.log(`[${tag}] job id=${job.job_id} target=${job.target} seedHash=${job.seed_hash?.slice(0, 8)}...`);
+            console.log(`[${tag}] job id=${job.job_id} target=${job.target}`);
           }
           if (msg.result && msg.result.status === 'OK') {
             console.log(`[${tag}] share accepted`);
+            minerRecord.accepted++;
           }
           if (msg.error) {
             console.log(`[${tag}] pool error: ${msg.error.message} (code ${msg.error.code})`);
+            minerRecord.rejected++;
           }
           safeSend(msg);
         } catch (e) {
@@ -141,27 +128,31 @@ wss.on('connection', (ws, req) => {
     });
   };
 
-  connectPool();
-
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
+    minerRecord.lastSeen = Date.now();
 
     if (msg.method === 'configure') {
       if (msg.wallet && /^[1-9A-HJ-NP-Za-km-z]{95}$|^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$/.test(msg.wallet)) wallet = msg.wallet;
       if (msg.poolHost) poolHost = String(msg.poolHost);
       if (msg.poolPort) poolPort = parseInt(msg.poolPort, 10) || poolPort;
       if (msg.worker) workerName = String(msg.worker).slice(0, 64);
+      minerRecord.wallet = wallet;
+      minerRecord.worker = workerName;
+      minerRecord.sysInfo = msg.sysInfo || null;
       connectPool();
       return;
     }
 
+    if (msg.method === 'stats') {
+      minerRecord.hashrate = msg.hashrate || 0;
+      minerRecord.workers = msg.workers || 0;
+      return;
+    }
+
     if (msg.method === 'submit') {
-      // Forward share to pool verbatim
-      sendPool({
-        id: msg.id || 2, jsonrpc: '2.0', method: 'submit',
-        params: msg.params,
-      });
+      sendPool({ id: msg.id || 2, jsonrpc: '2.0', method: 'submit', params: msg.params });
       return;
     }
 
@@ -173,6 +164,7 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     console.log(`[${tag}] client disconnected`);
+    miners.delete(tag);
     if (pool && !pool.destroyed) try { pool.destroy(); } catch (e) {}
   });
 });
@@ -180,4 +172,5 @@ wss.on('connection', (ws, req) => {
 server.listen(HTTP_PORT, '0.0.0.0', () => {
   console.log(`XMR LAN miner listening on 0.0.0.0:${HTTP_PORT}`);
   console.log(`Pool: ${POOL_HOST}:${POOL_PORT}  Wallet: ${WALLET.slice(0, 12)}...${WALLET.slice(-6)}`);
+  console.log(`Admin dashboard: http://0.0.0.0:${HTTP_PORT}/admin`);
 });

@@ -10,6 +10,8 @@
   .container { max-width: 720px; margin: 0 auto; }
   h1 { color: #ff6600; letter-spacing: 2px; }
   .head { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; padding-bottom: 1rem; margin-bottom: 1.5rem; }
+  .head a { color: #888; text-decoration: none; font-size: 13px; }
+  .head a:hover { color: #ff6600; }
   input, button {
     background: #1a1a1a; border: 1px solid #333; color: #e0e0e0;
     padding: 0.6rem 0.9rem; width: 100%; margin-bottom: 0.6rem;
@@ -17,7 +19,8 @@
   }
   button { background: #ff6600; color: #000; font-weight: bold; cursor: pointer; border: none; }
   button:hover { background: #ff8833; }
-  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+  label { color: #888; font-size: 12px; display: block; margin-bottom: 0.3rem; margin-top: 0.6rem; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
   .stat { background: #111; border: 1px solid #222; padding: 0.75rem; border-radius: 4px; }
   .label { color: #888; font-size: 11px; text-transform: uppercase; }
   .value { font-size: 22px; font-weight: bold; margin-top: 0.25rem; }
@@ -29,23 +32,46 @@
   .ok { color: #4caf50; }
   .err { color: #e74c3c; }
   .hidden { display: none; }
+  .sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 0.5rem; margin-bottom: 1rem; }
+  .sys-item { background: #111; border: 1px solid #222; padding: 0.5rem; border-radius: 4px; text-align: center; }
+  .sys-item .label { font-size: 10px; }
+  .sys-item .value { font-size: 16px; }
+  .worker-control { background: #111; border: 1px solid #222; padding: 0.75rem; border-radius: 4px; margin-bottom: 1rem; }
+  .worker-control label { display: inline; }
+  input[type="range"] { width: 100%; margin: 0.5rem 0; }
+  .row { display: flex; gap: 0.5rem; align-items: center; }
+  .row button { width: auto; margin: 0; }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="head">
     <h1>[ XMR LAN MINER ]</h1>
-    <span id="status">Disconnected</span>
+    <div><a href="/admin">Admin Dashboard →</a></div>
+  </div>
+
+  <!-- System Info -->
+  <div class="sys-grid">
+    <div class="sys-item"><div class="label">CPU Cores</div><div class="value" id="sysCores">—</div></div>
+    <div class="sys-item"><div class="label">RAM</div><div class="value" id="sysRam">—</div></div>
+    <div class="sys-item"><div class="label">Browser</div><div class="value" id="sysBrowser">—</div></div>
+    <div class="sys-item"><div class="label">OS</div><div class="value" id="sysOS">—</div></div>
   </div>
 
   <div id="setup">
-    <h3>Wallet Setup</h3>
     <label>Monero wallet</label>
     <input id="walletInput" placeholder="44... or 8...">
     <label>Pool host</label>
     <input id="poolHost" value="pool.supportxmr.com">
     <label>Pool port</label>
     <input id="poolPort" type="number" value="3333">
+
+    <div class="worker-control">
+      <label>Worker threads: <strong id="workerCountDisplay">4</strong> (max: <span id="maxCores">—</span>)</label>
+      <input type="range" id="workerCount" min="1" max="8" value="4" oninput="updateWorkerCount(this.value)">
+      <div style="font-size:11px;color:#888">More threads = more hashrate but hogs your CPU. Default: cores - 1.</div>
+    </div>
+
     <button onclick="startMining()">[ Start Mining ]</button>
   </div>
 
@@ -54,9 +80,12 @@
       <div class="stat"><div class="label">Hashrate</div><div class="value hashrate" id="hashrate">0 H/s</div></div>
       <div class="stat"><div class="label">Accepted</div><div class="value shares" id="accepted">0</div></div>
       <div class="stat"><div class="label">Rejected</div><div class="value" id="rejected" style="color:#e74c3c;">0</div></div>
+      <div class="stat"><div class="label">Threads</div><div class="value" id="activeThreads">0</div></div>
     </div>
     <div class="wallet-box" id="walletDisplay">—</div>
-    <button onclick="stopMining()" style="background:#444;color:#fff;margin-bottom:1rem;">[ Stop ]</button>
+    <div class="row" style="margin-bottom:1rem;">
+      <button onclick="stopMining()" style="background:#444;color:#fff;">[ Stop Mining ]</button>
+    </div>
     <div class="log-box" id="logBox"></div>
   </div>
 </div>

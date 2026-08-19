@@ -1,11 +1,14 @@
-// RandomX WASM worker — hashes blobs from the job and reports shares
+// RandomX WASM worker — hashes a nonce range, reports to main thread
 importScripts('randomx.js');
 
-let M = null;           // Emscripten module
+let M = null;
 let mining = false;
 let currentJob = null;
 let inPtr = 0, outPtr = 0;
 const IN_MAX = 256;
+let nonceStart = 0;
+let nonceEnd = 0;
+let nonceCur = 0;
 
 function post(type, extra = {}) { postMessage({ type, ...extra }); }
 
@@ -16,11 +19,9 @@ async function initModule() {
   if (!M._rx_alloc_cache()) throw new Error('cache alloc failed');
   inPtr = M._rx_malloc(IN_MAX);
   outPtr = M._rx_malloc(32);
-  post('status', { message: 'WASM loaded' });
 }
 
 async function ensureVM(seedHashHex) {
-  // RandomX needs one cache+VM per seed; reinit when seed changes
   const seedBin = hexToU8(seedHashHex);
   const seedPtr = M._rx_malloc(seedBin.length);
   M.HEAPU8.set(seedBin, seedPtr);
@@ -40,26 +41,22 @@ function bufToHex(u8) {
   return Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Compare hash against target — RandomX job target is 8-byte LE
 function meetsTarget(hashBuf, targetHex) {
   const t = hexToU8(targetHex);
-  // For 4-byte compact target, convert to 8-byte LE difficulty
   let target64;
   if (t.length === 4) {
-    const t32 = t[0] | (t[1] << 8) | (t[2] << 16) | (t[3] << 24 >>> 0);
-    const full = 0xffffffffn / BigInt(t32 >>> 0);
-    target64 = full * 0x100000000n; // scale back up to 64-bit space
+    const t32 = (t[0] | (t[1] << 8) | (t[2] << 16) | (t[3] << 24)) >>> 0;
+    const d = 0xffffffffffffffffn / (0xffffffffn / BigInt(t32));
+    target64 = 0xffffffffffffffffn / d;
   } else if (t.length === 8) {
     target64 = 0n;
     for (let i = 7; i >= 0; i--) target64 = (target64 << 8n) | BigInt(t[i]);
   } else if (t.length === 32) {
-    // 256-bit LE — high 32 bytes; the effective target is the last 8 bytes
     target64 = 0n;
     for (let i = 31; i >= 24; i--) target64 = (target64 << 8n) | BigInt(t[i]);
   } else {
     return false;
   }
-  // Read hash as little-endian 64-bit (last 8 bytes of the 32-byte hash)
   let hash64 = 0n;
   for (let i = 31; i >= 24; i--) hash64 = (hash64 << 8n) | BigInt(hashBuf[i]);
   return hash64 <= target64;
@@ -67,22 +64,20 @@ function meetsTarget(hashBuf, targetHex) {
 
 async function mineLoop() {
   while (mining) {
-    if (!currentJob) { await new Promise(r => setTimeout(r, 100)); continue; }
+    if (!currentJob || !M) { await new Promise(r => setTimeout(r, 100)); continue; }
     const job = currentJob;
     const blob = hexToU8(job.blob);
     if (blob.length > IN_MAX) { post('error', { message: 'blob too large' }); mining = false; break; }
 
     const t0 = Date.now();
     let hashes = 0;
-    let nonce = (Math.random() * 0xffffffff) >>> 0;
 
-    // Hash for ~500ms per batch, then yield
     while (Date.now() - t0 < 500 && mining && currentJob === job) {
-      // Write nonce into blob at offset 39 (standard CN/RX nonce offset)
-      blob[39] = nonce & 0xff;
-      blob[40] = (nonce >>> 8) & 0xff;
-      blob[41] = (nonce >>> 16) & 0xff;
-      blob[42] = (nonce >>> 24) & 0xff;
+      if (nonceCur >= nonceEnd) nonceCur = nonceStart; // wrap
+      blob[39] = nonceCur & 0xff;
+      blob[40] = (nonceCur >>> 8) & 0xff;
+      blob[41] = (nonceCur >>> 16) & 0xff;
+      blob[42] = (nonceCur >>> 24) & 0xff;
 
       M.HEAPU8.set(blob, inPtr);
       M._rx_calculate_hash(inPtr, blob.length, outPtr);
@@ -92,16 +87,16 @@ async function mineLoop() {
       if (meetsTarget(hash, job.target)) {
         post('share', {
           jobId: job.job_id,
-          nonce: nonce.toString(16).padStart(8, '0'),
+          nonce: nonceCur.toString(16).padStart(8, '0'),
           result: bufToHex(hash),
         });
       }
-      nonce = (nonce + 1) >>> 0;
+      nonceCur = (nonceCur + 1) >>> 0;
     }
 
     const elapsed = (Date.now() - t0) / 1000;
     post('hashrate', { hashrate: Math.round(hashes / Math.max(elapsed, 0.001)) });
-    await new Promise(r => setTimeout(r, 0)); // yield
+    await new Promise(r => setTimeout(r, 0));
   }
 }
 
@@ -113,19 +108,21 @@ self.onmessage = async (e) => {
       await ensureVM(msg.seedHash);
       post('ready');
     } else if (msg.type === 'job') {
-      if (!M) return; // not initialized yet, wait for init message
-      // If seed changed, re-init
+      if (!M) return;
       if (!currentJob || currentJob.seed_hash !== msg.job.seed_hash) {
         currentJob = msg.job;
         await ensureVM(msg.job.seed_hash);
       } else {
         currentJob = msg.job;
       }
-      post('status', { message: `Job ${msg.job.job_id} received` });
     } else if (msg.type === 'start') {
       if (!mining) { mining = true; mineLoop(); }
     } else if (msg.type === 'stop') {
       mining = false;
+    } else if (msg.type === 'nonceRange') {
+      nonceStart = msg.start;
+      nonceEnd = msg.end;
+      nonceCur = msg.start;
     }
   } catch (err) {
     post('error', { message: err.message });
