@@ -47,7 +47,7 @@
 <div class="container">
   <div class="head">
     <h1>[ XMR LAN MINER ]</h1>
-    <div><a href="/admin">Admin Dashboard →</a></div>
+    <div><span id="status">Disconnected</span> &nbsp; <a href="/admin">Admin →</a></div>
   </div>
 
   <!-- System Info -->
@@ -80,7 +80,8 @@
       <div class="stat"><div class="label">Hashrate</div><div class="value hashrate" id="hashrate">0 H/s</div></div>
       <div class="stat"><div class="label">Accepted</div><div class="value shares" id="accepted">0</div></div>
       <div class="stat"><div class="label">Rejected</div><div class="value" id="rejected" style="color:#e74c3c;">0</div></div>
-      <div class="stat"><div class="label">Threads</div><div class="value" id="activeThreads">0</div></div>
+      <div class="stat"><div class="label">Threads</div><div class="value" id="activeThreads" style="font-size:18px;">0</div></div>
+    <div class="stat"><div class="label">Status</div><div class="value" id="miningStatus" style="font-size:14px;color:#888;">idle</div></div>
     </div>
     <div class="wallet-box" id="walletDisplay">—</div>
     <div class="row" style="margin-bottom:1rem;">

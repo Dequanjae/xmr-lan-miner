@@ -73,6 +73,7 @@ let intervalId = null;
 async function refresh() {
   try {
     const [cfgR, minersR] = await Promise.all([fetch('/config'), fetch('/api/miners')]);
+    if (!cfgR.ok || !minersR.ok) throw new Error('API returned ' + cfgR.status + '/' + minersR.status);
     const cfg = await cfgR.json();
     const miners = await minersR.json();
 

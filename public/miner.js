@@ -11,6 +11,7 @@
   let numWorkers = Math.max(1, (navigator.hardwareConcurrency || 4) - 1);
 
   const $ = (id) => document.getElementById(id);
+  const safeSet = (id, val) => { const el = $(id); if (el) el.textContent = val; };
   const log = (msg, cls) => {
     const box = $('logBox');
     if (!box) return;
@@ -56,16 +57,18 @@
 
   function renderSystemInfo() {
     const sys = getSystemInfo();
-    if ($('sysCores')) $('sysCores').textContent = sys.cores;
-    if ($('sysRam')) $('sysRam').textContent = sys.ram;
-    if ($('sysBrowser')) $('sysBrowser').textContent = sys.browser;
-    if ($('sysOS')) $('sysOS').textContent = sys.os;
-    // Worker count slider
+    safeSet('sysCores', sys.cores);
+    safeSet('sysRam', sys.ram);
+    safeSet('sysBrowser', sys.browser);
+    safeSet('sysOS', sys.os);
     const slider = $('workerCount');
     if (slider) {
       slider.max = sys.cores;
       slider.value = numWorkers;
-      $('workerCountDisplay').textContent = numWorkers;
+      const disp = $('workerCountDisplay');
+      if (disp) disp.textContent = numWorkers;
+      const mc = $('maxCores');
+      if (mc) mc.textContent = sys.cores;
     }
     return sys;
   }
@@ -75,7 +78,8 @@
     ws = new WebSocket(`${proto}//${location.host}`);
     ws.onopen = () => {
       connected = true;
-      $('status').textContent = 'Connected';
+      safeSet('status', 'Connected');
+      safeSet('miningStatus', 'connected');
       log('WS connected, configuring pool...');
       // Send system info for admin dashboard
       const sys = getSystemInfo();
@@ -88,7 +92,7 @@
         sysInfo: sys,
       }));
     };
-    ws.onclose = () => { connected = false; $('status').textContent = 'Disconnected'; log('WS closed'); };
+    ws.onclose = () => { connected = false; safeSet('status', 'Disconnected'); safeSet('miningStatus', 'disconnected'); log('WS closed'); };
     ws.onerror = () => { log('WS error', 'err'); };
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
@@ -109,10 +113,10 @@
     }
     if (msg.id >= 10) {
       if (msg.result && msg.result.status === 'OK') {
-        accepted++; $('accepted').textContent = accepted;
+        accepted++; safeSet('accepted', accepted);
         log(`Share #${accepted} ACCEPTED`, 'ok');
       } else if (msg.error) {
-        rejected++; $('rejected').textContent = rejected;
+        rejected++; safeSet('rejected', rejected);
         log(`Share rejected: ${msg.error.message}`, 'err');
       }
       return;
@@ -159,7 +163,7 @@
           // Aggregate hashrate across all workers
           w._hashrate = m.hashrate;
           totalHashrate = workers.reduce((s, w2) => s + (w2._hashrate || 0), 0);
-          $('hashrate').textContent = totalHashrate + ' H/s';
+          safeSet('hashrate', totalHashrate + ' H/s');
           // Report to server for admin dashboard
           if (ws && connected) {
             ws.send(JSON.stringify({ method: 'stats', hashrate: totalHashrate, workers: n, accepted, rejected }));
@@ -198,6 +202,7 @@
     log(`Initializing ${numWorkers} RandomX workers (may take 30-60s)...`);
 
     startWorkers();
+    safeSet('activeThreads', numWorkers);
     connectWS({ wallet, poolHost, poolPort });
   };
 
@@ -205,7 +210,8 @@
     for (const w of workers) { w.postMessage({ type: 'stop' }); w.terminate(); }
     workers = [];
     if (ws) ws.close();
-    $('status').textContent = 'Stopped';
+    safeSet('status', 'Stopped');
+    safeSet('miningStatus', 'stopped');
     $('mining').classList.add('hidden');
     $('setup').classList.remove('hidden');
   };
