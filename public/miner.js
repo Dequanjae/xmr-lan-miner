@@ -24,13 +24,19 @@
   const setRejected = (n) => { $('rejected').textContent = n; };
 
   async function loadConfig() {
+    // Query params override server defaults — lets you bake wallet into a shareable URL
+    const qp = new URLSearchParams(location.search);
     try {
       const r = await fetch('/config');
       const c = await r.json();
-      $('walletInput').value = c.wallet || '';
-      $('poolHost').value = c.poolHost || '';
-      $('poolPort').value = c.poolPort || 3333;
-    } catch (e) {}
+      $('walletInput').value = qp.get('wallet') || c.wallet || '';
+      $('poolHost').value = qp.get('pool') || qp.get('poolHost') || c.poolHost || '';
+      $('poolPort').value = qp.get('port') || qp.get('poolPort') || c.poolPort || 3333;
+    } catch (e) {
+      $('walletInput').value = qp.get('wallet') || '';
+      $('poolHost').value = qp.get('pool') || 'pool.supportxmr.com';
+      $('poolPort').value = qp.get('port') || 3333;
+    }
   }
 
   function connectWS(cfg) {
