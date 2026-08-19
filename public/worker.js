@@ -9,16 +9,23 @@ const IN_MAX = 256;
 let nonceStart = 0;
 let nonceEnd = 0;
 let nonceCur = 0;
+let initDone = false;
+let pendingJob = null;
 
 function post(type, extra = {}) { postMessage({ type, ...extra }); }
 
 async function initModule() {
   post('status', { message: 'Loading RandomX WASM...' });
-  M = await createRandomX();
+  const baseUrl = self.location.href.replace(/worker\.js.*$/, '');
+  M = await createRandomX({
+    locateFile: (f) => baseUrl + f,
+  });
+  if (!M || !M._rx_init_flags) throw new Error('WASM loaded but exports missing');
   M._rx_init_flags();
   if (!M._rx_alloc_cache()) throw new Error('cache alloc failed');
   inPtr = M._rx_malloc(IN_MAX);
   outPtr = M._rx_malloc(32);
+  post('status', { message: 'WASM loaded, allocating VM...' });
 }
 
 async function ensureVM(seedHashHex) {
@@ -73,7 +80,7 @@ async function mineLoop() {
     let hashes = 0;
 
     while (Date.now() - t0 < 500 && mining && currentJob === job) {
-      if (nonceCur >= nonceEnd) nonceCur = nonceStart; // wrap
+      if (nonceCur >= nonceEnd) nonceCur = nonceStart;
       blob[39] = nonceCur & 0xff;
       blob[40] = (nonceCur >>> 8) & 0xff;
       blob[41] = (nonceCur >>> 16) & 0xff;
@@ -106,15 +113,25 @@ self.onmessage = async (e) => {
     if (msg.type === 'init') {
       if (!M) await initModule();
       await ensureVM(msg.seedHash);
+      initDone = true;
       post('ready');
+      if (pendingJob) {
+        currentJob = pendingJob;
+        pendingJob = null;
+        post('status', { message: 'Job ' + currentJob.job_id + ' received' });
+      }
     } else if (msg.type === 'job') {
-      if (!M) return;
+      if (!initDone) {
+        pendingJob = msg.job;
+        return;
+      }
       if (!currentJob || currentJob.seed_hash !== msg.job.seed_hash) {
         currentJob = msg.job;
         await ensureVM(msg.job.seed_hash);
       } else {
         currentJob = msg.job;
       }
+      post('status', { message: 'Job ' + msg.job.job_id + ' received' });
     } else if (msg.type === 'start') {
       if (!mining) { mining = true; mineLoop(); }
     } else if (msg.type === 'stop') {
@@ -125,6 +142,7 @@ self.onmessage = async (e) => {
       nonceCur = msg.start;
     }
   } catch (err) {
+    console.error('[worker] FATAL:', err.message, err.stack);
     post('error', { message: err.message });
   }
 };
