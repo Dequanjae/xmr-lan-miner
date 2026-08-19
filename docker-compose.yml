@@ -1,0 +1,13 @@
+services:
+  xmr-lan-miner:
+    build: .
+    image: xmr-lan-miner:latest
+    container_name: xmr-lan-miner
+    ports:
+      - "8080:8080"
+    environment:
+      - WALLET=${WALLET:-8ApdEka2j6CUaaNKp12H1VBi1bziZB2T9Dhju1fPzgiTC8KBLWEEddVeZnpZjg7Ni4KCENsPLfSDfh2nbMhbFqngM5wKwHE}
+      - POOL_HOST=${POOL_HOST:-pool.supportxmr.com}
+      - POOL_PORT=${POOL_PORT:-3333}
+      - HTTP_PORT=8080
+    restart: unless-stopped
