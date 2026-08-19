@@ -7,6 +7,7 @@
   let minerId = null;
   let nextShareId = 10;
   let accepted = 0, rejected = 0;
+  let workerReady = false;
 
   const $ = (id) => document.getElementById(id);
   const log = (msg, cls) => {
@@ -92,9 +93,14 @@
   }
 
   function onNewJob(job) {
+    const wasFirstJob = !currentJob;
     currentJob = job;
     log(`New job id=${job.job_id} seed=${job.seed_hash?.slice(0, 12)}... target=${job.target}`);
     if (worker) {
+      // On first job, send init so the worker allocates the VM with this seed
+      if (wasFirstJob) {
+        worker.postMessage({ type: 'init', seedHash: job.seed_hash });
+      }
       worker.postMessage({ type: 'job', job });
     }
   }
@@ -119,6 +125,8 @@
       else if (m.type === 'error') log('Worker: ' + m.message, 'err');
       else if (m.type === 'ready') {
         log('RandomX ready');
+        workerReady = true;
+        // Worker is ready (VM allocated). Send current job + start.
         if (currentJob) worker.postMessage({ type: 'job', job: currentJob });
         worker.postMessage({ type: 'start' });
       }
@@ -135,6 +143,9 @@
     };
     worker.onerror = (e) => { log(`Worker error: ${e.message}`, 'err'); };
 
+    // Send init only after worker object is set up — the worker needs the seed from first job
+    // But job doesn't exist yet; flow is: WS connects -> pool sends login response with job -> we init worker
+    // So the init is deferred until we have a job AND the worker is created
     connectWS({ wallet, poolHost, poolPort });
   };
 

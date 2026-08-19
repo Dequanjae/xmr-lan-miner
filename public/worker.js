@@ -113,6 +113,7 @@ self.onmessage = async (e) => {
       await ensureVM(msg.seedHash);
       post('ready');
     } else if (msg.type === 'job') {
+      if (!M) return; // not initialized yet, wait for init message
       // If seed changed, re-init
       if (!currentJob || currentJob.seed_hash !== msg.job.seed_hash) {
         currentJob = msg.job;
