@@ -97,20 +97,21 @@ async function mineLoop() {
     //   0 = nonce space exhausted
     //   1 = share found (get nonce via n(), hash via scratch)
     //   >1 = JIT bytecode size — compile and execute, then call Rm() again
-    // Batch 512 iterations before yielding (matches l1mey112 reference)
+    // Small batches: each WebAssembly.Instance allocates executable memory.
+    // Too many instances before GC = "out of memory". 64 iterations per batch
+    // gives GC room to free old instances.
+    const BATCH = 64;
+    
     while (mining && currentJob === job) {
-      let shareFound = false;
-      for (let iter = 0; iter < 512; iter++) {
+      for (let iter = 0; iter < BATCH; iter++) {
         const jitSize = vmExports.Rm();
         
         if (jitSize === 0) {
-          // Nonce space exhausted — wrap around
           vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
           continue;
         }
         
         if (jitSize === 1) {
-          // Share found!
           const nonce = Number(vmExports.n());
           const hash = new Uint8Array(scratch.slice(0, 32));
           post('share', {
@@ -118,13 +119,11 @@ async function mineLoop() {
             nonce: nonce.toString(16).padStart(8, '0'),
             result: bufToHex(hash),
           });
-          // Continue mining
           vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
-          shareFound = true;
           break;
         }
         
-        // jitSize > 1: compile and execute the JIT program
+        // Compile and execute JIT program
         const jitWm = new WebAssembly.Module(scratch.subarray(0, jitSize));
         const jitWi = new WebAssembly.Instance(jitWm, jitImports);
         jitWi.exports.d();
@@ -133,12 +132,10 @@ async function mineLoop() {
       // Report hashrate
       const hashCount = vmExports.h();
       const elapsed = (Date.now() - t0) / 1000;
-      const hashrate = Math.round(hashCount / Math.max(elapsed, 0.001));
-      post('hashrate', { hashrate });
-      lastHashCount = hashCount;
+      post('hashrate', { hashrate: Math.round(hashCount / Math.max(elapsed, 0.001)) });
       
-      // Yield — keep event loop alive
-      await new Promise(r => setTimeout(r, backgroundMode ? 10 : 0));
+      // Yield — let GC free old WebAssembly instances
+      await new Promise(r => setTimeout(r, backgroundMode ? 20 : 5));
     }
     
     const elapsed = (Date.now() - t0) / 1000;

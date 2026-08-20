@@ -9,7 +9,9 @@
   let accepted = 0, rejected = 0;
   let totalHashrate = 0;
   let cores = navigator.hardwareConcurrency || 4;
-  let numWorkers = cores - 1; // default: all but one
+  // Cap at 8 by default — each worker loads its own WASM + 256MB cache.
+  // Too many workers = executable memory exhaustion in Firefox.
+  let numWorkers = Math.min(cores - 1, 8);
   let backgroundMode = false;
 
   const $ = (id) => document.getElementById(id);
@@ -71,7 +73,7 @@
     safeSet('sysMode', 'JIT');
     const slider = $('workerCount');
     if (slider) {
-      slider.max = cores;
+      slider.max = Math.min(cores, 8);
       slider.value = numWorkers;
       const disp = $('workerCountDisplay');
       if (disp) disp.textContent = numWorkers;
