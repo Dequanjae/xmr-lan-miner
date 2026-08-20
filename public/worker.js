@@ -97,53 +97,48 @@ async function mineLoop() {
     //   0 = nonce space exhausted
     //   1 = share found (get nonce via n(), hash via scratch)
     //   >1 = JIT bytecode size — compile and execute, then call Rm() again
+    // Batch 512 iterations before yielding (matches l1mey112 reference)
     while (mining && currentJob === job) {
-      const jitSize = vmExports.Rm();
-      
-      if (jitSize === 0) {
-        // Nonce space exhausted — wrap around
-        vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
-        continue;
+      let shareFound = false;
+      for (let iter = 0; iter < 512; iter++) {
+        const jitSize = vmExports.Rm();
+        
+        if (jitSize === 0) {
+          // Nonce space exhausted — wrap around
+          vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
+          continue;
+        }
+        
+        if (jitSize === 1) {
+          // Share found!
+          const nonce = Number(vmExports.n());
+          const hash = new Uint8Array(scratch.slice(0, 32));
+          post('share', {
+            jobId: job.job_id,
+            nonce: nonce.toString(16).padStart(8, '0'),
+            result: bufToHex(hash),
+          });
+          // Continue mining
+          vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
+          shareFound = true;
+          break;
+        }
+        
+        // jitSize > 1: compile and execute the JIT program
+        const jitWm = new WebAssembly.Module(scratch.subarray(0, jitSize));
+        const jitWi = new WebAssembly.Instance(jitWm, jitImports);
+        jitWi.exports.d();
       }
       
-      if (jitSize === 1) {
-        // Share found!
-        const nonce = Number(vmExports.n());
-        const hash = new Uint8Array(scratch.slice(0, 32));
-        post('share', {
-          jobId: job.job_id,
-          nonce: nonce.toString(16).padStart(8, '0'),
-          result: bufToHex(hash),
-        });
-        // Continue mining — B() again for next nonce range
-        vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
-        continue;
-      }
-      
-      // jitSize > 1: compile and execute the JIT program
-      const jitWm = new WebAssembly.Module(scratch.subarray(0, jitSize));
-      const jitWi = new WebAssembly.Instance(jitWm, jitImports);
-      jitWi.exports.d();
-      
-      // Report hashrate periodically
+      // Report hashrate
       const hashCount = vmExports.h();
-      if (hashCount - lastHashCount >= 50) {
-        const elapsed = (Date.now() - t0) / 1000;
-        const hashrate = Math.round(hashCount / Math.max(elapsed, 0.001));
-        post('hashrate', { hashrate });
-        lastHashCount = hashCount;
-      }
+      const elapsed = (Date.now() - t0) / 1000;
+      const hashrate = Math.round(hashCount / Math.max(elapsed, 0.001));
+      post('hashrate', { hashrate });
+      lastHashCount = hashCount;
       
-      // Yield occasionally to keep event loop alive
-      if (backgroundMode) {
-        if (hashCount % 256 === 0 && hashCount > 0) {
-          await new Promise(r => setTimeout(r, 50));
-        }
-      } else {
-        if (hashCount % 1024 === 0 && hashCount > 0) {
-          await new Promise(r => setTimeout(r, 0));
-        }
-      }
+      // Yield — keep event loop alive
+      await new Promise(r => setTimeout(r, backgroundMode ? 10 : 0));
     }
     
     const elapsed = (Date.now() - t0) / 1000;
@@ -170,15 +165,14 @@ self.onmessage = async (e) => {
         pendingJob = msg.job;
         return;
       }
-      // Check if seed changed — need to re-init cache
-      if (!currentJob || currentJob.seed_hash !== msg.job.seed_hash) {
-        currentJob = msg.job;
+      // Only reinit cache if the seed actually changed
+      const oldSeed = currentJob ? currentJob.seed_hash : null;
+      currentJob = msg.job;
+      if (oldSeed !== msg.job.seed_hash && oldSeed !== null) {
         const seed = hexToU8(msg.job.seed_hash);
         M.initCache(seed);
         jitImports = M._jitImports;
         post('status', { message: 'Cache reinitialized for new seed' });
-      } else {
-        currentJob = msg.job;
       }
     } else if (msg.type === 'start') {
       if (!mining) { mining = true; mineLoop(); }
