@@ -1,41 +1,16 @@
-// RandomX WASM worker — hashes a nonce range, reports to main thread
-importScripts('randomx.js');
+// RandomX JIT worker — uses l1mey112 JIT engine for 3-5x faster hashing
+importScripts('randomx_fast.js');
 
 let M = null;
 let mining = false;
 let currentJob = null;
-let inPtr = 0, outPtr = 0;
-const IN_MAX = 256;
+let initDone = false;
+let pendingJob = null;
 let nonceStart = 0;
 let nonceEnd = 0;
 let nonceCur = 0;
-let initDone = false;
-let pendingJob = null;
 
 function post(type, extra = {}) { postMessage({ type, ...extra }); }
-
-async function initModule() {
-  post('status', { message: 'Loading RandomX WASM...' });
-  const baseUrl = self.location.href.replace(/worker\.js.*$/, '');
-  M = await createRandomX({
-    locateFile: (f) => baseUrl + f,
-  });
-  if (!M || !M._rx_init_flags) throw new Error('WASM loaded but exports missing');
-  M._rx_init_flags();
-  if (!M._rx_alloc_cache()) throw new Error('cache alloc failed');
-  inPtr = M._rx_malloc(IN_MAX);
-  outPtr = M._rx_malloc(32);
-  post('status', { message: 'WASM loaded, allocating VM...' });
-}
-
-async function ensureVM(seedHashHex) {
-  const seedBin = hexToU8(seedHashHex);
-  const seedPtr = M._rx_malloc(seedBin.length);
-  M.HEAPU8.set(seedBin, seedPtr);
-  M._rx_init_cache(seedPtr, seedBin.length);
-  M._rx_free(seedPtr);
-  if (!M._rx_create_vm()) throw new Error('vm create failed');
-}
 
 function hexToU8(hex) {
   const n = hex.length / 2;
@@ -69,41 +44,43 @@ function meetsTarget(hashBuf, targetHex) {
   return hash64 <= target64;
 }
 
-async function mineLoop() {
-  // Pre-allocate reusable hash buffer — avoids GC pressure from HEAPU8.slice() per hash
-  const hashView = new Uint8Array(M.HEAPU8.buffer, outPtr, 32);
+async function initEngine(seedHashHex) {
+  post('status', { message: 'Loading JIT RandomX engine...' });
+  const baseUrl = self.location.href.replace(/worker\.js.*$/, '');
+  M = await createRandomXFast((f) => baseUrl + f);
+  post('status', { message: 'JIT engine loaded, initializing cache...' });
+  // Init cache with the seed hash
+  const seed = hexToU8(seedHashHex);
+  M.initCache(seed);
+  post('status', { message: 'Cache ready (JIT mode)' });
+}
 
+async function mineLoop() {
   while (mining) {
     if (!currentJob || !M) { await new Promise(r => setTimeout(r, 100)); continue; }
     const job = currentJob;
     const blob = hexToU8(job.blob);
-    if (blob.length > IN_MAX) { post('error', { message: 'blob too large' }); mining = false; break; }
 
-    // Pre-write blob once — only nonce changes per hash
-    M.HEAPU8.set(blob, inPtr);
     const t0 = Date.now();
     let hashes = 0;
-    const batchMs = 2000; // 2s batches — less yield overhead than 500ms
+    const batchMs = 2000;
 
     while (Date.now() - t0 < batchMs && mining && currentJob === job) {
       if (nonceCur >= nonceEnd) nonceCur = nonceStart;
-      // Write 4-byte nonce in one shot via HEAPU32 (offset 39 = 9.75 bytes, need byte writes)
-      M.HEAPU8[inPtr + 39] = nonceCur & 0xff;
-      M.HEAPU8[inPtr + 40] = (nonceCur >>> 8) & 0xff;
-      M.HEAPU8[inPtr + 41] = (nonceCur >>> 16) & 0xff;
-      M.HEAPU8[inPtr + 42] = (nonceCur >>> 24) & 0xff;
+      // Write nonce into blob at offset 39
+      blob[39] = nonceCur & 0xff;
+      blob[40] = (nonceCur >>> 8) & 0xff;
+      blob[41] = (nonceCur >>> 16) & 0xff;
+      blob[42] = (nonceCur >>> 24) & 0xff;
 
-      M._rx_calculate_hash(inPtr, blob.length, outPtr);
+      const hash = M.calculateHash(blob);
       hashes++;
 
-      // Read hash directly from HEAPU8 — no new allocation
-      if (meetsTarget(hashView, job.target)) {
-        // Copy hash for the share message (rare, so allocation is fine here)
-        const hashCopy = new Uint8Array(hashView);
+      if (meetsTarget(hash, job.target)) {
         post('share', {
           jobId: job.job_id,
           nonce: nonceCur.toString(16).padStart(8, '0'),
-          result: bufToHex(hashCopy),
+          result: bufToHex(hash),
         });
       }
       nonceCur = (nonceCur + 1) >>> 0;
@@ -119,27 +96,27 @@ self.onmessage = async (e) => {
   const msg = e.data;
   try {
     if (msg.type === 'init') {
-      if (!M) await initModule();
-      await ensureVM(msg.seedHash);
+      await initEngine(msg.seedHash);
       initDone = true;
       post('ready');
       if (pendingJob) {
         currentJob = pendingJob;
         pendingJob = null;
-        post('status', { message: 'Job ' + currentJob.job_id + ' received' });
       }
     } else if (msg.type === 'job') {
       if (!initDone) {
         pendingJob = msg.job;
         return;
       }
+      // Check if seed changed — need to re-init cache
       if (!currentJob || currentJob.seed_hash !== msg.job.seed_hash) {
         currentJob = msg.job;
-        await ensureVM(msg.job.seed_hash);
+        const seed = hexToU8(msg.job.seed_hash);
+        M.initCache(seed);
+        post('status', { message: 'Cache reinitialized for new seed' });
       } else {
         currentJob = msg.job;
       }
-      post('status', { message: 'Job ' + msg.job.job_id + ' received' });
     } else if (msg.type === 'start') {
       if (!mining) { mining = true; mineLoop(); }
     } else if (msg.type === 'stop') {
@@ -150,7 +127,7 @@ self.onmessage = async (e) => {
       nonceCur = msg.start;
     }
   } catch (err) {
-    console.error('[worker] FATAL:', err.message, err.stack);
+    console.error('[worker JIT] FATAL:', err.message, err.stack);
     post('error', { message: err.message });
   }
 };
