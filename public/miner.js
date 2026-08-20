@@ -1,4 +1,4 @@
-// Main thread: manage worker pool, WS to proxy, submit shares, system info
+// Main thread: manage worker pool, WS to proxy, submit shares, system info, auto-start
 (() => {
   let ws = null;
   let workers = [];
@@ -8,7 +8,9 @@
   let nextShareId = 10;
   let accepted = 0, rejected = 0;
   let totalHashrate = 0;
-  let numWorkers = Math.max(1, (navigator.hardwareConcurrency || 4) - 1);
+  let cores = navigator.hardwareConcurrency || 4;
+  let numWorkers = cores - 1; // default: all but one
+  let backgroundMode = false;
 
   const $ = (id) => document.getElementById(id);
   const safeSet = (id, val) => { const el = $(id); if (el) el.textContent = val; };
@@ -23,10 +25,8 @@
   };
 
   function getSystemInfo() {
-    const cores = navigator.hardwareConcurrency || 1;
-    const ram = navigator.deviceMemory ? navigator.deviceMemory + ' GB' : 'unknown';
-    const ua = navigator.userAgent;
     let browser = 'unknown';
+    const ua = navigator.userAgent;
     if (ua.includes('Firefox')) browser = 'Firefox';
     else if (ua.includes('Edg')) browser = 'Edge';
     else if (ua.includes('Chrome')) browser = 'Chrome';
@@ -37,38 +37,46 @@
     else if (ua.includes('Linux')) os = 'Linux';
     else if (ua.includes('Android')) os = 'Android';
     else if (ua.includes('iPhone') || ua.includes('iPad')) os = 'iOS';
-    return { cores, ram, browser, os, ua: ua.slice(0, 80) };
+    return { cores, browser, os };
   }
 
   async function loadConfig() {
     const qp = new URLSearchParams(location.search);
+    // Query param wallet overrides localStorage overrides server default
+    const savedWallet = localStorage.getItem('xmr-wallet') || '';
     try {
       const r = await fetch('/config');
       const c = await r.json();
-      $('walletInput').value = qp.get('wallet') || c.wallet || '';
+      $('walletInput').value = qp.get('wallet') || savedWallet || c.wallet || '';
       $('poolHost').value = qp.get('pool') || qp.get('poolHost') || c.poolHost || '';
       $('poolPort').value = qp.get('port') || qp.get('poolPort') || c.poolPort || 3333;
     } catch (e) {
-      $('walletInput').value = qp.get('wallet') || '';
+      $('walletInput').value = qp.get('wallet') || savedWallet || '';
       $('poolHost').value = qp.get('pool') || 'pool.supportxmr.com';
       $('poolPort').value = qp.get('port') || 3333;
     }
+    // Load saved preferences
+    backgroundMode = localStorage.getItem('xmr-background') === '1';
+    const bgCheckbox = $('backgroundMode');
+    if (bgCheckbox) bgCheckbox.checked = backgroundMode;
+    const savedWorkers = localStorage.getItem('xmr-workers');
+    if (savedWorkers) numWorkers = parseInt(savedWorkers, 10) || numWorkers;
   }
 
   function renderSystemInfo() {
     const sys = getSystemInfo();
     safeSet('sysCores', sys.cores);
-    safeSet('sysRam', sys.ram);
     safeSet('sysBrowser', sys.browser);
     safeSet('sysOS', sys.os);
+    safeSet('sysMode', 'JIT');
     const slider = $('workerCount');
     if (slider) {
-      slider.max = sys.cores;
+      slider.max = cores;
       slider.value = numWorkers;
       const disp = $('workerCountDisplay');
       if (disp) disp.textContent = numWorkers;
       const mc = $('maxCores');
-      if (mc) mc.textContent = sys.cores;
+      if (mc) mc.textContent = cores;
     }
     return sys;
   }
@@ -81,7 +89,6 @@
       safeSet('status', 'Connected');
       safeSet('miningStatus', 'connected');
       log('WS connected, configuring pool...');
-      // Send system info for admin dashboard
       const sys = getSystemInfo();
       ws.send(JSON.stringify({
         method: 'configure',
@@ -130,11 +137,8 @@
     const wasFirstJob = !currentJob;
     currentJob = job;
     log(`New job id=${job.job_id} seed=${job.seed_hash?.slice(0, 12)}... target=${job.target}`);
-
     if (workers.length === 0) return;
-
     if (wasFirstJob) {
-      // Init all workers with this seed
       for (const w of workers) w.postMessage({ type: 'init', seedHash: job.seed_hash });
     } else {
       for (const w of workers) w.postMessage({ type: 'job', job });
@@ -155,16 +159,14 @@
         if (m.type === 'status') log(m.message);
         else if (m.type === 'error') log(`Worker ${i}: ${m.message}`, 'err');
         else if (m.type === 'ready') {
-          log(`Worker ${i} ready`);
+          log(`Worker ${i} ready (JIT)`);
           w.postMessage({ type: 'job', job: currentJob });
           w.postMessage({ type: 'start' });
         }
         else if (m.type === 'hashrate') {
-          // Aggregate hashrate across all workers
           w._hashrate = m.hashrate;
           totalHashrate = workers.reduce((s, w2) => s + (w2._hashrate || 0), 0);
           safeSet('hashrate', totalHashrate + ' H/s');
-          // Report to server for admin dashboard
           if (ws && connected) {
             ws.send(JSON.stringify({ method: 'stats', hashrate: totalHashrate, workers: n, accepted, rejected }));
           }
@@ -182,7 +184,7 @@
       w.onerror = (e) => { log(`Worker ${i} error: ${e.message}`, 'err'); };
       workers.push(w);
     }
-    log(`Started ${n} workers`);
+    log(`Started ${n} JIT workers`);
   }
 
   window.startMining = async function () {
@@ -192,17 +194,26 @@
     if (!wallet || wallet.length < 90) { alert('Invalid XMR wallet address'); return; }
     if (!poolHost) { alert('Pool host required'); return; }
 
-    // Read worker count from slider
+    // Save wallet + prefs
+    localStorage.setItem('xmr-wallet', wallet);
+    localStorage.setItem('xmr-workers', numWorkers.toString());
+
     const slider = $('workerCount');
     if (slider) numWorkers = parseInt(slider.value, 10) || numWorkers;
+    const bgCheckbox = $('backgroundMode');
+    if (bgCheckbox) { backgroundMode = bgCheckbox.checked; localStorage.setItem('xmr-background', backgroundMode ? '1' : '0'); }
+
+    // In background mode, use fewer workers to keep the system responsive
+    const effectiveWorkers = backgroundMode ? Math.max(1, Math.floor(numWorkers / 2)) : numWorkers;
+    numWorkers = effectiveWorkers;
 
     $('setup').classList.add('hidden');
     $('mining').classList.remove('hidden');
     $('walletDisplay').textContent = wallet;
-    log(`Initializing ${numWorkers} RandomX workers (may take 30-60s)...`);
+    log(`Initializing ${effectiveWorkers} JIT workers${backgroundMode ? ' (background mode)' : ''}...`);
 
     startWorkers();
-    safeSet('activeThreads', numWorkers);
+    safeSet('activeThreads', effectiveWorkers);
     connectWS({ wallet, poolHost, poolPort });
   };
 
@@ -220,6 +231,19 @@
     $('workerCountDisplay').textContent = val;
   };
 
+  // Auto-start: if wallet is saved, start mining on page load
+  function tryAutoStart() {
+    const qp = new URLSearchParams(location.search);
+    const wallet = qp.get('wallet') || localStorage.getItem('xmr-wallet');
+    if (wallet && wallet.length >= 90) {
+      log('Auto-starting with saved wallet...');
+      // Small delay to let config load
+      setTimeout(() => window.startMining(), 500);
+    }
+  }
+
   loadConfig();
   renderSystemInfo();
+  // Auto-start after config loads
+  setTimeout(tryAutoStart, 1000);
 })();

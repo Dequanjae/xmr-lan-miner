@@ -9,6 +9,7 @@ let pendingJob = null;
 let nonceStart = 0;
 let nonceEnd = 0;
 let nonceCur = 0;
+let backgroundMode = false;
 
 function post(type, extra = {}) { postMessage({ type, ...extra }); }
 
@@ -63,7 +64,9 @@ async function mineLoop() {
 
     const t0 = Date.now();
     let hashes = 0;
-    const batchMs = 2000;
+    // Background mode: shorter batches + longer yields so browser stays responsive
+    const batchMs = backgroundMode ? 500 : 2000;
+    const yieldMs = backgroundMode ? 50 : 0;
 
     while (Date.now() - t0 < batchMs && mining && currentJob === job) {
       if (nonceCur >= nonceEnd) nonceCur = nonceStart;
@@ -88,7 +91,7 @@ async function mineLoop() {
 
     const elapsed = (Date.now() - t0) / 1000;
     post('hashrate', { hashrate: Math.round(hashes / Math.max(elapsed, 0.001)) });
-    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, yieldMs));
   }
 }
 
@@ -125,6 +128,8 @@ self.onmessage = async (e) => {
       nonceStart = msg.start;
       nonceEnd = msg.end;
       nonceCur = msg.start;
+    } else if (msg.type === 'background') {
+      backgroundMode = msg.enabled;
     }
   } catch (err) {
     console.error('[worker JIT] FATAL:', err.message, err.stack);

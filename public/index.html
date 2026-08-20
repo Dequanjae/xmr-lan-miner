@@ -39,21 +39,25 @@
   .worker-control { background: #111; border: 1px solid #222; padding: 0.75rem; border-radius: 4px; margin-bottom: 1rem; }
   .worker-control label { display: inline; }
   input[type="range"] { width: 100%; margin: 0.5rem 0; }
+  .checkbox-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.6rem; }
+  .checkbox-row input { width: auto; margin: 0; }
+  .checkbox-row label { margin: 0; cursor: pointer; }
   .row { display: flex; gap: 0.5rem; align-items: center; }
   .row button { width: auto; margin: 0; }
+  .jit-badge { background: #0d4429; color: #4caf50; padding: 2px 8px; border-radius: 12px; font-size: 10px; font-weight: bold; }
+  .auto-note { font-size: 11px; color: #666; margin-top: 0.3rem; }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="head">
     <h1>[ XMR LAN MINER ]</h1>
-    <div><span id="status">Disconnected</span> &nbsp; <a href="/admin">Admin →</a></div>
+    <div><span id="status">Disconnected</span> <span class="jit-badge">JIT</span> &nbsp; <a href="/admin">Admin →</a></div>
   </div>
 
-  <!-- System Info -->
   <div class="sys-grid">
     <div class="sys-item"><div class="label">CPU Cores</div><div class="value" id="sysCores">—</div></div>
-    <div class="sys-item"><div class="label">RAM</div><div class="value" id="sysRam">—</div></div>
+    <div class="sys-item"><div class="label">Engine</div><div class="value" id="sysMode" style="font-size:14px;color:#4caf50">JIT</div></div>
     <div class="sys-item"><div class="label">Browser</div><div class="value" id="sysBrowser">—</div></div>
     <div class="sys-item"><div class="label">OS</div><div class="value" id="sysOS">—</div></div>
   </div>
@@ -69,10 +73,16 @@
     <div class="worker-control">
       <label>Worker threads: <strong id="workerCountDisplay">4</strong> (max: <span id="maxCores">—</span>)</label>
       <input type="range" id="workerCount" min="1" max="8" value="4" oninput="updateWorkerCount(this.value)">
-      <div style="font-size:11px;color:#888">More threads = more hashrate but hogs your CPU. Default: cores - 1.</div>
+      <div style="font-size:11px;color:#888">More threads = more hashrate. Max = your CPU core count.</div>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="backgroundMode">
+      <label for="backgroundMode">Background mode (fewer threads, longer pauses — keeps browser smooth for other tabs)</label>
     </div>
 
     <button onclick="startMining()">[ Start Mining ]</button>
+    <div class="auto-note">Wallet + settings are saved. Next time you open this page, mining auto-starts.</div>
   </div>
 
   <div id="mining" class="hidden">
@@ -81,7 +91,7 @@
       <div class="stat"><div class="label">Accepted</div><div class="value shares" id="accepted">0</div></div>
       <div class="stat"><div class="label">Rejected</div><div class="value" id="rejected" style="color:#e74c3c;">0</div></div>
       <div class="stat"><div class="label">Threads</div><div class="value" id="activeThreads" style="font-size:18px;">0</div></div>
-    <div class="stat"><div class="label">Status</div><div class="value" id="miningStatus" style="font-size:14px;color:#888;">idle</div></div>
+      <div class="stat"><div class="label">Status</div><div class="value" id="miningStatus" style="font-size:14px;color:#888;">idle</div></div>
     </div>
     <div class="wallet-box" id="walletDisplay">—</div>
     <div class="row" style="margin-bottom:1rem;">
