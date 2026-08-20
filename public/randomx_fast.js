@@ -184,5 +184,9 @@ async function createRandomXFast(locateFile) {
     calculateHash,
     calculateHexHash,
     feature: _feature,
+    // Expose internals for mining VM mode
+    get _vmExports() { return _vmExports; },
+    get _scratch() { return _scratch; },
+    get _jitImports() { return _jitImports; },
   };
 }

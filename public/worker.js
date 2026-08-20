@@ -1,4 +1,5 @@
-// RandomX JIT worker — uses l1mey112 JIT engine for 3-5x faster hashing
+// RandomX JIT mining worker — uses l1mey112 mining VM (B/Rm/n/h exports)
+// The nonce loop runs INSIDE the WASM — much faster than JS-level iteration
 importScripts('randomx_fast.js');
 
 let M = null;
@@ -10,6 +11,11 @@ let nonceStart = 0;
 let nonceEnd = 0;
 let nonceCur = 0;
 let backgroundMode = false;
+
+// Access to the raw VM exports from the JIT engine
+let vmExports = null;
+let scratch = null;
+let jitImports = null;
 
 function post(type, extra = {}) { postMessage({ type, ...extra }); }
 
@@ -24,77 +30,109 @@ function bufToHex(u8) {
   return Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function meetsTarget(hashBuf, targetHex) {
-  const t = hexToU8(targetHex);
-  let target64;
-  if (t.length === 4) {
-    const t32 = (t[0] | (t[1] << 8) | (t[2] << 16) | (t[3] << 24)) >>> 0;
-    const d = 0xffffffffffffffffn / (0xffffffffn / BigInt(t32));
-    target64 = 0xffffffffffffffffn / d;
-  } else if (t.length === 8) {
-    target64 = 0n;
-    for (let i = 7; i >= 0; i--) target64 = (target64 << 8n) | BigInt(t[i]);
-  } else if (t.length === 32) {
-    target64 = 0n;
-    for (let i = 31; i >= 24; i--) target64 = (target64 << 8n) | BigInt(t[i]);
-  } else {
-    return false;
-  }
-  let hash64 = 0n;
-  for (let i = 31; i >= 24; i--) hash64 = (hash64 << 8n) | BigInt(hashBuf[i]);
-  return hash64 <= target64;
-}
-
 async function initEngine(seedHashHex) {
   post('status', { message: 'Loading JIT RandomX engine...' });
   const baseUrl = self.location.href.replace(/worker\.js.*$/, '');
   M = await createRandomXFast((f) => baseUrl + f);
+  
+  // Access the internal VM exports that randomx_fast.js set up
+  vmExports = M._vmExports;
+  scratch = M._scratch;
+  jitImports = M._jitImports;
+  
   post('status', { message: 'JIT engine loaded, building cache (Argon2)...' });
   post('initProgress', { phase: 'cache', progress: 10 });
-  // Init cache with the seed hash — this runs Argon2 + superscalar hash generation
+  
   const seed = hexToU8(seedHashHex);
   M.initCache(seed);
+  
+  // After initCache, jitImports is updated with the new thunk
+  jitImports = M._jitImports;
+  
   post('initProgress', { phase: 'done', progress: 100 });
-  post('status', { message: 'Cache ready (JIT mode)' });
+  post('status', { message: 'Cache ready (JIT mining mode)' });
 }
 
 async function mineLoop() {
   while (mining) {
-    if (!currentJob || !M) { await new Promise(r => setTimeout(r, 100)); continue; }
+    if (!currentJob || !M || !vmExports) { 
+      await new Promise(r => setTimeout(r, 100)); 
+      continue; 
+    }
+    
     const job = currentJob;
-    const blob = hexToU8(job.blob);
-
+    
+    // Use the mining VM: B() sets up blob + target + nonce range
+    // Then Rm() runs the internal loop, returning 1 when share found, 0 when exhausted
+    scratch.set(hexToU8(job.blob));
+    
+    // B(blob_length, target, nonce_start, nonce_end) — target as BigInt
+    const target = BigInt('0x' + job.target.split('').reverse().join('')) || 0n;
+    // Actually target is hex string, need to parse properly
+    const targetHex = job.target;
+    let targetBigInt = 0n;
+    // Pool target is 4-byte LE hex — convert to 64-bit
+    const t = hexToU8(targetHex);
+    if (t.length === 4) {
+      const t32 = (t[0] | (t[1] << 8) | (t[2] << 16) | (t[3] << 24)) >>> 0;
+      targetBigInt = BigInt(t32);
+    } else if (t.length === 8) {
+      for (let i = 7; i >= 0; i--) targetBigInt = (targetBigInt << 8n) | BigInt(t[i]);
+    } else {
+      targetBigInt = 0xffffffffn;
+    }
+    
+    vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
+    
+    post('status', { message: `Mining job ${job.job_id} nonce [${nonceStart}, ${nonceEnd})` });
+    
+    let lastHashCount = 0;
     const t0 = Date.now();
-    let hashes = 0;
-    // No capping — all workers run. Just yield occasionally so the OS can schedule other tabs.
-    // Background mode uses slightly longer yields (50ms vs 0ms) for smoother multitasking.
-    const batchMs = 2000;
-    const yieldMs = backgroundMode ? 50 : 0;
-
-    while (Date.now() - t0 < batchMs && mining && currentJob === job) {
-      if (nonceCur >= nonceEnd) nonceCur = nonceStart;
-      // Write nonce into blob at offset 39
-      blob[39] = nonceCur & 0xff;
-      blob[40] = (nonceCur >>> 8) & 0xff;
-      blob[41] = (nonceCur >>> 16) & 0xff;
-      blob[42] = (nonceCur >>> 24) & 0xff;
-
-      const hash = M.calculateHash(blob);
-      hashes++;
-
-      if (meetsTarget(hash, job.target)) {
+    
+    // Mining loop — Rm() returns 0 (exhausted) or 1 (share found)
+    while (mining && currentJob === job) {
+      const result = vmExports.Rm();
+      
+      if (result === 1) {
+        // Share found! Get nonce and hash
+        const nonce = vmExports.n();
+        const hash = scratch.slice(0, 32);
         post('share', {
           jobId: job.job_id,
-          nonce: nonceCur.toString(16).padStart(8, '0'),
+          nonce: nonce.toString(16).padStart(8, '0'),
           result: bufToHex(hash),
         });
+        // Continue mining — VM auto-advances to next nonce
+      } else if (result === 0) {
+        // Nonce space exhausted — wrap around
+        vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
       }
-      nonceCur = (nonceCur + 1) >>> 0;
+      
+      // Report hashrate periodically
+      const hashCount = vmExports.h();
+      if (hashCount - lastHashCount >= 10) {
+        const elapsed = (Date.now() - t0) / 1000;
+        const hashrate = Math.round(hashCount / Math.max(elapsed, 0.001));
+        post('hashrate', { hashrate });
+        lastHashCount = hashCount;
+      }
+      
+      // Yield occasionally
+      if (backgroundMode) {
+        await new Promise(r => setTimeout(r, 50));
+      } else {
+        // Tiny yield every 512 iterations to keep event loop alive
+        if (hashCount % 512 === 0 && hashCount > 0) {
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
     }
-
+    
     const elapsed = (Date.now() - t0) / 1000;
-    post('hashrate', { hashrate: Math.round(hashes / Math.max(elapsed, 0.001)) });
-    await new Promise(r => setTimeout(r, yieldMs));
+    const finalHashCount = vmExports.h();
+    if (finalHashCount > 0) {
+      post('hashrate', { hashrate: Math.round(finalHashCount / Math.max(elapsed, 0.001)) });
+    }
   }
 }
 
@@ -119,6 +157,7 @@ self.onmessage = async (e) => {
         currentJob = msg.job;
         const seed = hexToU8(msg.job.seed_hash);
         M.initCache(seed);
+        jitImports = M._jitImports;
         post('status', { message: 'Cache reinitialized for new seed' });
       } else {
         currentJob = msg.job;
@@ -135,7 +174,7 @@ self.onmessage = async (e) => {
       backgroundMode = msg.enabled;
     }
   } catch (err) {
-    console.error('[worker JIT] FATAL:', err.message, err.stack);
+    console.error('[worker JIT miner] FATAL:', err.message, err.stack);
     post('error', { message: err.message });
   }
 };
