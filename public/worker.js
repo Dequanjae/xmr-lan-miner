@@ -1,5 +1,4 @@
-// RandomX JIT mining worker — non-shared (per-worker cache)
-// Each worker loads WASM, builds own cache, mines independently
+// Worker: receives shared cache from main thread, creates own VM, mines
 importScripts('randomx_fast.js');
 
 let vmExports = null;
@@ -7,9 +6,7 @@ let scratch = null;
 let jitImports = null;
 let mining = false;
 let currentJob = null;
-let nonceStart = 0;
-let nonceEnd = 0;
-let nonceCur = 0;
+let nonceStart = 0, nonceEnd = 0, nonceCur = 0;
 let backgroundMode = false;
 let initialized = false;
 let pendingJob = null;
@@ -42,23 +39,36 @@ function hex2target(hex) {
   return 0n;
 }
 
-async function initEngine(seedHashHex) {
-  post('status', { message: 'Loading JIT RandomX engine...' });
-  const baseUrl = self.location.href.replace(/worker\.js.*$/, '').replace(/\?.*$/, '');
-  M = await createRandomXFast((f) => baseUrl + f);
-  vmExports = M._vmExports;
-  scratch = M._scratch;
-  jitImports = M._jitImports;
-  post('status', { message: 'JIT engine loaded, building cache (Argon2)...' });
-  post('initProgress', { phase: 'cache', progress: 10 });
-  const seed = hexToU8(seedHashHex);
-  M.initCache(seed);
-  jitImports = M._jitImports;
-  post('initProgress', { phase: 'done', progress: 100 });
-  post('status', { message: 'Cache ready (JIT mining mode)' });
-}
-
-let M = null;
+self.onmessage = async (e) => {
+  const msg = e.data;
+  try {
+    if (msg.type === 'setup') {
+      post('status', { message: 'Setting up JIT VM (shared cache)...' });
+      await initWorkerVM(msg.datasetMemory, msg.thunkBytes, msg.vmWasmBytes, msg.feature);
+      initialized = true;
+      post('ready');
+    } else if (msg.type === 'reinitCache') {
+      reinitThunk(msg.datasetMemory, msg.thunkBytes);
+      post('status', { message: 'Cache reinitialized for new seed' });
+    } else if (msg.type === 'job') {
+      if (!initialized) { pendingJob = msg.job; return; }
+      currentJob = msg.job;
+    } else if (msg.type === 'start') {
+      if (!mining) { mining = true; mineLoop(); }
+    } else if (msg.type === 'stop') {
+      mining = false;
+    } else if (msg.type === 'nonceRange') {
+      nonceStart = msg.start;
+      nonceEnd = msg.end;
+      nonceCur = msg.start;
+    } else if (msg.type === 'background') {
+      backgroundMode = msg.enabled;
+    }
+  } catch (err) {
+    console.error('[worker] FATAL:', err.message, err.stack);
+    post('error', { message: err.message });
+  }
+};
 
 async function mineLoop() {
   while (mining) {
@@ -111,44 +121,3 @@ async function mineLoop() {
     }
   }
 }
-
-self.onmessage = async (e) => {
-  const msg = e.data;
-  try {
-    if (msg.type === 'init') {
-      await initEngine(msg.seedHash);
-      initialized = true;
-      post('ready');
-      if (pendingJob) {
-        currentJob = pendingJob;
-        pendingJob = null;
-      }
-    } else if (msg.type === 'job') {
-      if (!initialized) {
-        pendingJob = msg.job;
-        return;
-      }
-      const oldSeed = currentJob ? currentJob.seed_hash : null;
-      currentJob = msg.job;
-      if (oldSeed !== msg.job.seed_hash && oldSeed !== null) {
-        const seed = hexToU8(msg.job.seed_hash);
-        M.initCache(seed);
-        jitImports = M._jitImports;
-        post('status', { message: 'Cache reinitialized for new seed' });
-      }
-    } else if (msg.type === 'start') {
-      if (!mining) { mining = true; mineLoop(); }
-    } else if (msg.type === 'stop') {
-      mining = false;
-    } else if (msg.type === 'nonceRange') {
-      nonceStart = msg.start;
-      nonceEnd = msg.end;
-      nonceCur = msg.start;
-    } else if (msg.type === 'background') {
-      backgroundMode = msg.enabled;
-    }
-  } catch (err) {
-    console.error('[worker] FATAL:', err.message, err.stack);
-    post('error', { message: err.message });
-  }
-};

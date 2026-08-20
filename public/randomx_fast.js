@@ -1,5 +1,6 @@
-// randomx_fast.js — JIT RandomX engine (non-shared, per-worker)
-// Based on l1mey112/randomx.js architecture, pure JS (no TS/bun/bundler)
+// randomx_fast.js — JIT RandomX with shared memory support
+// Main thread: buildSharedCache() creates one SharedArrayBuffer-backed cache
+// Workers: initWorkerVM() creates per-worker VM (2MB) using shared cache
 
 const WASM_PAGES = 4098;
 const SCRATCH_SIZE = 16 * 1024;
@@ -19,88 +20,73 @@ async function detectFeature(fmaWasmBytes, simdWasmBytes) {
   return _feature;
 }
 
-let _vmExports = null;
-let _scratch = null;
-let _jitImports = null;
-let _memory = null;
-let _datasetMemory = null;
-
-async function initRandomX(datasetWasmBytes, vmWasmBytes, fmaWasmBytes, simdWasmBytes) {
+// ---- Main thread: build shared cache (one-time) ----
+async function buildSharedCache(datasetWasmBytes, vmWasmBytes, fmaWasmBytes, simdWasmBytes, keyBytes) {
   await detectFeature(fmaWasmBytes, simdWasmBytes);
 
-  const vmMemory = new WebAssembly.Memory({ initial: 33, maximum: 33 });
-  const datasetMemory = new WebAssembly.Memory({ initial: WASM_PAGES, maximum: WASM_PAGES });
+  // Shared dataset memory — SharedArrayBuffer-backed, transferable to workers
+  const datasetMemory = new WebAssembly.Memory({
+    initial: WASM_PAGES, maximum: WASM_PAGES, shared: true
+  });
 
   const datasetModule = new WebAssembly.Module(datasetWasmBytes);
   const datasetInstance = new WebAssembly.Instance(datasetModule, { env: { memory: datasetMemory } });
   const datasetExports = datasetInstance.exports;
 
-  const vmModule = new WebAssembly.Module(vmWasmBytes);
-  const vmInstance = new WebAssembly.Instance(vmModule, { env: { memory: vmMemory } });
-  _vmExports = vmInstance.exports;
-
-  const scratchPtr = _vmExports.i(_feature);
-  _scratch = new Uint8Array(vmMemory.buffer, scratchPtr, SCRATCH_SIZE);
-  _memory = vmMemory;
-  _datasetMemory = datasetMemory;
-}
-
-function initCache(keyBytes) {
+  // Init cache
   if (keyBytes.length > 60) throw new Error('Key too long (max 60 bytes)');
-  const jitBegin = _datasetExports ? _datasetExports.c(WASM_PAGES, false) : null;
-  if (jitBegin === null || jitBegin === undefined) return;
-  const keyBuf = new Uint8Array(_datasetMemory.buffer, jitBegin, 60);
+  const jitBegin = datasetExports.c(WASM_PAGES, true);
+  const keyBuf = new Uint8Array(datasetMemory.buffer, jitBegin, 60);
   keyBuf.set(keyBytes);
-  const jitSize = _datasetExports.K(keyBytes.length);
-  const jitBuffer = new Uint8Array(_datasetMemory.buffer, jitBegin, jitSize);
-
-  const thunkModule = new WebAssembly.Module(jitBuffer);
-  const thunkInstance = new WebAssembly.Instance(thunkModule, { e: { m: _datasetMemory } });
-  const superscalarHash = thunkInstance.exports.d;
-
-  _jitImports = { e: { m: _memory, d: superscalarHash } };
-}
-
-let _datasetExports = null;
-
-async function initRandomXFull(datasetWasmBytes, vmWasmBytes, fmaWasmBytes, simdWasmBytes) {
-  await detectFeature(fmaWasmBytes, simdWasmBytes);
-
-  const vmMemory = new WebAssembly.Memory({ initial: 33, maximum: 33 });
-  const datasetMemory = new WebAssembly.Memory({ initial: WASM_PAGES, maximum: WASM_PAGES });
-
-  const datasetModule = new WebAssembly.Module(datasetWasmBytes);
-  const datasetInstance = new WebAssembly.Instance(datasetModule, { env: { memory: datasetMemory } });
-  _datasetExports = datasetInstance.exports;
-
-  const vmModule = new WebAssembly.Module(vmWasmBytes);
-  const vmInstance = new WebAssembly.Instance(vmModule, { env: { memory: vmMemory } });
-  _vmExports = vmInstance.exports;
-
-  const scratchPtr = _vmExports.i(_feature);
-  _scratch = new Uint8Array(vmMemory.buffer, scratchPtr, SCRATCH_SIZE);
-  _memory = vmMemory;
-  _datasetMemory = datasetMemory;
-}
-
-async function createRandomXFast(locateFile) {
-  const [datasetWasm, vmWasm, fmaWasm, simdWasm] = await Promise.all([
-    fetch(locateFile('dataset.wasm')).then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-    fetch(locateFile('vm.wasm')).then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-    fetch(locateFile('fma.wasm')).then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-    fetch(locateFile('simd.wasm')).then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-  ]);
-
-  await initRandomXFull(datasetWasm, vmWasm, fmaWasm, simdWasm);
+  const jitSize = datasetExports.K(keyBytes.length);
+  const jitBuffer = new Uint8Array(datasetMemory.buffer, jitBegin, jitSize);
 
   return {
-    initCache,
+    datasetMemory,
+    thunkBytes: jitBuffer.slice(0),
     feature: _feature,
-    get _vmExports() { return _vmExports; },
-    get _scratch() { return _scratch; },
-    get _jitImports() { return _jitImports; },
   };
 }
 
-if (typeof module !== 'undefined') module.exports = { createRandomXFast };
-if (typeof self !== 'undefined') self.createRandomXFast = createRandomXFast;
+// ---- Worker: create per-worker VM using shared cache ----
+let _vmExports = null;
+let _scratch = null;
+let _jitImports = null;
+let _vmMemory = null;
+let _datasetMemory = null;
+
+async function initWorkerVM(datasetMemory, thunkBytes, vmWasmBytes, feature) {
+  _datasetMemory = datasetMemory;
+
+  // Per-worker VM memory (non-shared, 2MB)
+  _vmMemory = new WebAssembly.Memory({ initial: 33, maximum: 33 });
+
+  const vmModule = new WebAssembly.Module(vmWasmBytes);
+  const vmInstance = new WebAssembly.Instance(vmModule, { env: { memory: _vmMemory } });
+  _vmExports = vmInstance.exports;
+
+  const scratchPtr = _vmExports.i(feature);
+  _scratch = new Uint8Array(_vmMemory.buffer, scratchPtr, SCRATCH_SIZE);
+
+  // Create thunk instance using shared dataset memory
+  const thunkModule = new WebAssembly.Module(thunkBytes);
+  const thunkInstance = new WebAssembly.Instance(thunkModule, { e: { m: _datasetMemory } });
+  const superscalarHash = thunkInstance.exports.d;
+
+  // JIT imports: VM memory (per-worker) + superscalar hash (shared)
+  _jitImports = { e: { m: _vmMemory, d: superscalarHash } };
+}
+
+function reinitThunk(datasetMemory, thunkBytes) {
+  const thunkModule = new WebAssembly.Module(thunkBytes);
+  const thunkInstance = new WebAssembly.Instance(thunkModule, { e: { m: datasetMemory } });
+  if (_jitImports) _jitImports.e.d = thunkInstance.exports.d;
+}
+
+if (typeof module !== 'undefined') module.exports = { buildSharedCache, initWorkerVM, reinitThunk, detectFeature };
+if (typeof self !== 'undefined') {
+  self.buildSharedCache = buildSharedCache;
+  self.initWorkerVM = initWorkerVM;
+  self.reinitThunk = reinitThunk;
+  self.detectFeature = detectFeature;
+}
