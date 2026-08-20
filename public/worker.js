@@ -98,9 +98,9 @@ async function mineLoop() {
     //   1 = share found (get nonce via n(), hash via scratch)
     //   >1 = JIT bytecode size — compile and execute, then call Rm() again
     // Small batches: each WebAssembly.Instance allocates executable memory.
-    // Too many instances before GC = "out of memory". 64 iterations per batch
-    // gives GC room to free old instances.
-    const BATCH = 64;
+    // Too many instances before GC = "out of memory". 128 iterations per batch
+    // with 0ms yield gives GC room without killing throughput.
+    const BATCH = 128;
     
     while (mining && currentJob === job) {
       for (let iter = 0; iter < BATCH; iter++) {
@@ -135,7 +135,8 @@ async function mineLoop() {
       post('hashrate', { hashrate: Math.round(hashCount / Math.max(elapsed, 0.001)) });
       
       // Yield — let GC free old WebAssembly instances
-      await new Promise(r => setTimeout(r, backgroundMode ? 20 : 5));
+      // Use 0ms yield (just releases to event loop) — GC runs in microtask gaps
+      await new Promise(r => setTimeout(r, 0));
     }
     
     const elapsed = (Date.now() - t0) / 1000;
