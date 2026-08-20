@@ -4,7 +4,8 @@
   let ws = null, workers = [], connected = false, currentJob = null, minerId = null;
   let nextShareId = 10, accepted = 0, rejected = 0, totalHashrate = 0;
   let cores = navigator.hardwareConcurrency || 4;
-  let numWorkers = Math.min(cores - 1, 8);
+  // Go for max cores — the module cache + instance reuse helps with executable memory
+  let numWorkers = Math.min(cores - 1, 19);
   let backgroundMode = false;
 
   const $ = (id) => document.getElementById(id);
@@ -49,7 +50,7 @@
     backgroundMode = localStorage.getItem('xmr-background') === '1';
     const bg = $('backgroundMode'); if (bg) bg.checked = backgroundMode;
     const sw = localStorage.getItem('xmr-workers');
-    if (sw) numWorkers = Math.min(parseInt(sw, 10) || numWorkers, 8);
+    if (sw) numWorkers = Math.min(parseInt(sw, 10) || numWorkers, 19);
   }
 
   function renderSystemInfo() {
@@ -58,9 +59,9 @@
     safeSet('sysOS', sys.os); safeSet('sysMode', 'JIT');
     const slider = $('workerCount');
     if (slider) {
-      slider.max = Math.min(cores, 8); slider.value = numWorkers;
+      slider.max = Math.min(cores, 19); slider.value = numWorkers;
       const d = $('workerCountDisplay'); if (d) d.textContent = numWorkers;
-      const m = $('maxCores'); if (m) m.textContent = Math.min(cores, 8);
+      const m = $('maxCores'); if (m) m.textContent = Math.min(cores, 19);
     }
   }
 

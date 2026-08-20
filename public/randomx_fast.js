@@ -26,13 +26,14 @@ let _memory = null;
 let _datasetMemory = null;
 let _datasetExports = null;
 
-// JIT module cache — avoid recompiling the same RandomX programs
-const _moduleCache = new Map(); // bytecode hash → WebAssembly.Module
+// JIT module + instance cache
+// Module compilation is cheap (~0.12ms), instance creation is expensive (~40ms executable memory alloc)
+// Cache both — reuse instances when possible
+const _moduleCache = new Map(); // bytecode hash → { module, instance }
 let _cacheHits = 0;
 let _cacheMisses = 0;
 
 function hashBytecode(bytes) {
-  // Fast hash of JIT bytecode for cache lookup
   let h = 0;
   const len = bytes.length;
   for (let i = 0; i < len; i += 7) { h = ((h << 5) - h + bytes[i]) | 0; }
@@ -41,21 +42,23 @@ function hashBytecode(bytes) {
 
 function getOrCompileModule(bytecode) {
   const key = hashBytecode(bytecode);
-  let mod = _moduleCache.get(key);
-  if (mod) {
+  let entry = _moduleCache.get(key);
+  if (entry) {
     _cacheHits++;
-    return mod;
+    // Reuse existing instance — skip executable memory allocation
+    return entry;
   }
   _cacheMisses++;
-  mod = new WebAssembly.Module(bytecode);
-  // Cap cache size to avoid memory issues
-  if (_moduleCache.size > 200) {
-    // Clear oldest entries (Map maintains insertion order)
+  const mod = new WebAssembly.Module(bytecode);
+  const inst = new WebAssembly.Instance(mod, _jitImports);
+  if (_moduleCache.size > 500) {
+    // Clear oldest entries
     const firstKey = _moduleCache.keys().next().value;
     _moduleCache.delete(firstKey);
   }
-  _moduleCache.set(key, mod);
-  return mod;
+  entry = { module: mod, instance: inst };
+  _moduleCache.set(key, entry);
+  return entry;
 }
 
 async function initRandomXFull(datasetWasmBytes, vmWasmBytes, fmaWasmBytes, simdWasmBytes) {
@@ -99,11 +102,11 @@ function getScratch() { return _scratch; }
 function getJitImports() { return _jitImports; }
 
 // Compile and execute a JIT program with caching
+// Cached entries reuse the instance (skip executable memory allocation)
 function executeJitProgram(jitSize) {
   const bytecode = _scratch.subarray(0, jitSize);
-  const mod = getOrCompileModule(bytecode);
-  const inst = new WebAssembly.Instance(mod, _jitImports);
-  inst.exports.d();
+  const entry = getOrCompileModule(bytecode);
+  entry.instance.exports.d();
 }
 
 async function createRandomXFast(locateFile) {

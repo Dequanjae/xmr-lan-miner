@@ -71,7 +71,7 @@ async function mineLoop() {
     vmExports.B(blob.length, targetBigInt, nonceStart, nonceEnd);
 
     const t0 = Date.now();
-    const BATCH = 128;
+    const BATCH = 64; // smaller batches = more frequent GC = less executable memory pressure
 
     while (mining && currentJob === job) {
       for (let iter = 0; iter < BATCH; iter++) {
