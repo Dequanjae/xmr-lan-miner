@@ -10,9 +10,6 @@ let nonceStart = 0;
 let nonceEnd = 0;
 let nonceCur = 0;
 let backgroundMode = false;
-// Full dataset mode: 2-5x faster hashing but takes ~10 min to initialize
-// Light mode: instant start, slower per-hash
-let fullMode = false;
 
 function post(type, extra = {}) { postMessage({ type, ...extra }); }
 
@@ -52,10 +49,12 @@ async function initEngine(seedHashHex) {
   post('status', { message: 'Loading JIT RandomX engine...' });
   const baseUrl = self.location.href.replace(/worker\.js.*$/, '');
   M = await createRandomXFast((f) => baseUrl + f);
-  post('status', { message: 'JIT engine loaded, initializing cache...' });
-  // Init cache with the seed hash
+  post('status', { message: 'JIT engine loaded, building cache (Argon2)...' });
+  post('initProgress', { phase: 'cache', progress: 10 });
+  // Init cache with the seed hash — this runs Argon2 + superscalar hash generation
   const seed = hexToU8(seedHashHex);
   M.initCache(seed);
+  post('initProgress', { phase: 'done', progress: 100 });
   post('status', { message: 'Cache ready (JIT mode)' });
 }
 
@@ -134,8 +133,6 @@ self.onmessage = async (e) => {
       nonceCur = msg.start;
     } else if (msg.type === 'background') {
       backgroundMode = msg.enabled;
-    } else if (msg.type === 'fullMode') {
-      fullMode = msg.enabled;
     }
   } catch (err) {
     console.error('[worker JIT] FATAL:', err.message, err.stack);

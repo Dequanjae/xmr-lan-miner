@@ -81,9 +81,13 @@
       <label for="backgroundMode">Background mode (small yields between batches so other tabs stay smooth — no worker capping)</label>
     </div>
 
-    <div class="checkbox-row">
-      <input type="checkbox" id="fullMode">
-      <label for="fullMode">Full dataset mode (2-5x faster hashing, but takes ~10 min to initialize on first start)</label>
+    <!-- Progress bar for cache init -->
+    <div id="initProgress" class="hidden" style="margin-bottom:1rem;">
+      <label style="color:#888;font-size:12px;">Initializing JIT cache... <span id="initPercent">0%</span></label>
+      <div style="background:#1a1a1a;border:1px solid #333;border-radius:4px;height:20px;overflow:hidden;">
+        <div id="initBar" style="background:#ff6600;height:100%;width:0%;transition:width 0.3s;"></div>
+      </div>
+      <div id="initDetail" style="font-size:11px;color:#666;margin-top:4px;"></div>
     </div>
 
     <button onclick="startMining()">[ Start Mining ]</button>

@@ -59,9 +59,6 @@
     backgroundMode = localStorage.getItem('xmr-background') === '1';
     const bgCheckbox = $('backgroundMode');
     if (bgCheckbox) bgCheckbox.checked = backgroundMode;
-    const fullCheckbox = $('fullMode');
-    const savedFull = localStorage.getItem('xmr-fullmode') === '1';
-    if (fullCheckbox) fullCheckbox.checked = savedFull;
     const savedWorkers = localStorage.getItem('xmr-workers');
     if (savedWorkers) numWorkers = parseInt(savedWorkers, 10) || numWorkers;
   }
@@ -157,15 +154,36 @@
       const end = (i === n - 1) ? 0xffffffff : start + range;
       w.postMessage({ type: 'nonceRange', start, end });
       w.postMessage({ type: 'background', enabled: backgroundMode });
-      w.postMessage({ type: 'fullMode', enabled: fullMode });
 
       w.onmessage = (e) => {
         const m = e.data;
         if (m.type === 'status') log(m.message);
         else if (m.type === 'error') log(`Worker ${i}: ${m.message}`, 'err');
+        else if (m.type === 'initProgress') {
+          // Track per-worker init progress
+          w._initProgress = m.progress;
+          // Show progress bar
+          const bar = $('initProgress');
+          if (bar) bar.classList.remove('hidden');
+          // Aggregate: average across all workers
+          const totalProgress = workers.reduce((s, w2) => s + (w2._initProgress || 0), 0) / workers.length;
+          const pct = Math.round(totalProgress);
+          const barEl = $('initBar');
+          const pctEl = $('initPercent');
+          const detailEl = $('initDetail');
+          if (barEl) barEl.style.width = pct + '%';
+          if (pctEl) pctEl.textContent = pct + '%';
+          if (detailEl) {
+            const ready = workers.filter(w2 => (w2._initProgress || 0) >= 100).length;
+            detailEl.textContent = `${ready}/${workers.length} workers ready`;
+          }
+          if (pct >= 100) {
+            setTimeout(() => { if (bar) bar.classList.add('hidden'); }, 2000);
+          }
+        }
         else if (m.type === 'ready') {
-          log(`Worker ${i} ready (JIT)`);
-          w.postMessage({ type: 'job', job: currentJob });
+          log(`Worker ${i} ready (JIT) — mining!`);
+          // Worker is ready and already has the job from pendingJob — just start
           w.postMessage({ type: 'start' });
         }
         else if (m.type === 'hashrate') {
@@ -207,9 +225,6 @@
     if (slider) numWorkers = parseInt(slider.value, 10) || numWorkers;
     const bgCheckbox = $('backgroundMode');
     if (bgCheckbox) { backgroundMode = bgCheckbox.checked; localStorage.setItem('xmr-background', backgroundMode ? '1' : '0'); }
-    const fullCheckbox = $('fullMode');
-    let fullMode = false;
-    if (fullCheckbox) { fullMode = fullCheckbox.checked; localStorage.setItem('xmr-fullmode', fullMode ? '1' : '0'); }
 
     // In background mode, use fewer workers to keep the system responsive
     const effectiveWorkers = numWorkers;
