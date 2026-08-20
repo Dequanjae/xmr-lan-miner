@@ -67,19 +67,23 @@ async function mineLoop() {
     scratch.set(hexToU8(job.blob));
     
     // B(blob_length, target, nonce_start, nonce_end) — target as BigInt
-    const target = BigInt('0x' + job.target.split('').reverse().join('')) || 0n;
-    // Actually target is hex string, need to parse properly
+    // Must match l1mey112's hex2target exactly
     const targetHex = job.target;
-    let targetBigInt = 0n;
-    // Pool target is 4-byte LE hex — convert to 64-bit
-    const t = hexToU8(targetHex);
-    if (t.length === 4) {
-      const t32 = (t[0] | (t[1] << 8) | (t[2] << 16) | (t[3] << 24)) >>> 0;
-      targetBigInt = BigInt(t32);
-    } else if (t.length === 8) {
-      for (let i = 7; i >= 0; i--) targetBigInt = (targetBigInt << 8n) | BigInt(t[i]);
+    const tBytes = hexToU8(targetHex);
+    let targetBigInt;
+    if (tBytes.length === 4) {
+      // 4-byte LE target → convert to 64-bit difficulty target
+      const u32 = new Uint32Array(tBytes.buffer)[0];
+      targetBigInt = 0xFFFFFFFFFFFFFFFFn / (0xFFFFFFFFn / BigInt(u32));
+    } else if (tBytes.length === 8) {
+      const u64 = new BigUint64Array(tBytes.buffer)[0];
+      targetBigInt = u64;
     } else {
-      targetBigInt = 0xffffffffn;
+      // Fallback: treat as large number
+      targetBigInt = 0n;
+      for (let i = tBytes.length - 1; i >= 0; i--) {
+        targetBigInt = (targetBigInt << 8n) | BigInt(tBytes[i]);
+      }
     }
     
     vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
@@ -89,40 +93,54 @@ async function mineLoop() {
     let lastHashCount = 0;
     const t0 = Date.now();
     
-    // Mining loop — Rm() returns 0 (exhausted) or 1 (share found)
+    // Mining loop — Rm() returns:
+    //   0 = nonce space exhausted
+    //   1 = share found (get nonce via n(), hash via scratch)
+    //   >1 = JIT bytecode size — compile and execute, then call Rm() again
     while (mining && currentJob === job) {
-      const result = vmExports.Rm();
+      const jitSize = vmExports.Rm();
       
-      if (result === 1) {
-        // Share found! Get nonce and hash
-        const nonce = vmExports.n();
-        const hash = scratch.slice(0, 32);
+      if (jitSize === 0) {
+        // Nonce space exhausted — wrap around
+        vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
+        continue;
+      }
+      
+      if (jitSize === 1) {
+        // Share found!
+        const nonce = Number(vmExports.n());
+        const hash = new Uint8Array(scratch.slice(0, 32));
         post('share', {
           jobId: job.job_id,
           nonce: nonce.toString(16).padStart(8, '0'),
           result: bufToHex(hash),
         });
-        // Continue mining — VM auto-advances to next nonce
-      } else if (result === 0) {
-        // Nonce space exhausted — wrap around
+        // Continue mining — B() again for next nonce range
         vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
+        continue;
       }
+      
+      // jitSize > 1: compile and execute the JIT program
+      const jitWm = new WebAssembly.Module(scratch.subarray(0, jitSize));
+      const jitWi = new WebAssembly.Instance(jitWm, jitImports);
+      jitWi.exports.d();
       
       // Report hashrate periodically
       const hashCount = vmExports.h();
-      if (hashCount - lastHashCount >= 10) {
+      if (hashCount - lastHashCount >= 50) {
         const elapsed = (Date.now() - t0) / 1000;
         const hashrate = Math.round(hashCount / Math.max(elapsed, 0.001));
         post('hashrate', { hashrate });
         lastHashCount = hashCount;
       }
       
-      // Yield occasionally
+      // Yield occasionally to keep event loop alive
       if (backgroundMode) {
-        await new Promise(r => setTimeout(r, 50));
+        if (hashCount % 256 === 0 && hashCount > 0) {
+          await new Promise(r => setTimeout(r, 50));
+        }
       } else {
-        // Tiny yield every 512 iterations to keep event loop alive
-        if (hashCount % 512 === 0 && hashCount > 0) {
+        if (hashCount % 1024 === 0 && hashCount > 0) {
           await new Promise(r => setTimeout(r, 0));
         }
       }
