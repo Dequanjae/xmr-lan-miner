@@ -144,12 +144,11 @@
     log('Building shared JIT cache (one-time, ~3-5s)...');
     showProgress(5, 'Loading WASM modules...');
 
-    const baseUrl = location.href.replace(/\?.*$/, '').replace(/\/[^\/]*$/, '/') || '/';
     const [datasetWasm, vmWasm, fmaWasm, simdWasm] = await Promise.all([
-      fetch(baseUrl + 'dataset.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-      fetch(baseUrl + 'vm.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-      fetch(baseUrl + 'fma.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-      fetch(baseUrl + 'simd.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch('dataset.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch('vm.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch('fma.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch('simd.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
     ]);
 
     showProgress(20, 'Building Argon2 cache + superscalar JIT...');
@@ -163,7 +162,7 @@
     const n = numWorkers;
     const range = Math.floor(0xffffffff / n);
     for (let i = 0; i < n; i++) {
-      const w = new Worker(baseUrl + 'worker.js');
+      const w = new Worker('worker.js');
       const start = i * range;
       const end = (i === n - 1) ? 0xffffffff : start + range;
 
@@ -200,12 +199,11 @@
   async function rebuildCache(job) {
     log('Seed changed — rebuilding shared cache...');
     showProgress(10, 'Rebuilding cache...');
-    const baseUrl = location.href.replace(/\?.*$/, '').replace(/\/[^\/]*$/, '/') || '/';
     const [datasetWasm, vmWasm, fmaWasm, simdWasm] = await Promise.all([
-      fetch(baseUrl + 'dataset.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-      fetch(baseUrl + 'vm.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-      fetch(baseUrl + 'fma.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-      fetch(baseUrl + 'simd.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch('dataset.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch('vm.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch('fma.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch('simd.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
     ]);
     const seed = hexToU8(job.seed_hash);
     const cache = await buildSharedCache(datasetWasm, vmWasm, fmaWasm, simdWasm, seed);
