@@ -78,7 +78,12 @@
 
     <div class="checkbox-row">
       <input type="checkbox" id="backgroundMode">
-      <label for="backgroundMode">Background mode (fewer threads, longer pauses — keeps browser smooth for other tabs)</label>
+      <label for="backgroundMode">Background mode (small yields between batches so other tabs stay smooth — no worker capping)</label>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="fullMode">
+      <label for="fullMode">Full dataset mode (2-5x faster hashing, but takes ~10 min to initialize on first start)</label>
     </div>
 
     <button onclick="startMining()">[ Start Mining ]</button>

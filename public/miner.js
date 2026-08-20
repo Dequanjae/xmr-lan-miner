@@ -59,6 +59,9 @@
     backgroundMode = localStorage.getItem('xmr-background') === '1';
     const bgCheckbox = $('backgroundMode');
     if (bgCheckbox) bgCheckbox.checked = backgroundMode;
+    const fullCheckbox = $('fullMode');
+    const savedFull = localStorage.getItem('xmr-fullmode') === '1';
+    if (fullCheckbox) fullCheckbox.checked = savedFull;
     const savedWorkers = localStorage.getItem('xmr-workers');
     if (savedWorkers) numWorkers = parseInt(savedWorkers, 10) || numWorkers;
   }
@@ -153,6 +156,8 @@
       const start = i * range;
       const end = (i === n - 1) ? 0xffffffff : start + range;
       w.postMessage({ type: 'nonceRange', start, end });
+      w.postMessage({ type: 'background', enabled: backgroundMode });
+      w.postMessage({ type: 'fullMode', enabled: fullMode });
 
       w.onmessage = (e) => {
         const m = e.data;
@@ -202,10 +207,12 @@
     if (slider) numWorkers = parseInt(slider.value, 10) || numWorkers;
     const bgCheckbox = $('backgroundMode');
     if (bgCheckbox) { backgroundMode = bgCheckbox.checked; localStorage.setItem('xmr-background', backgroundMode ? '1' : '0'); }
+    const fullCheckbox = $('fullMode');
+    let fullMode = false;
+    if (fullCheckbox) { fullMode = fullCheckbox.checked; localStorage.setItem('xmr-fullmode', fullMode ? '1' : '0'); }
 
     // In background mode, use fewer workers to keep the system responsive
-    const effectiveWorkers = backgroundMode ? Math.max(1, Math.floor(numWorkers / 2)) : numWorkers;
-    numWorkers = effectiveWorkers;
+    const effectiveWorkers = numWorkers;
 
     $('setup').classList.add('hidden');
     $('mining').classList.remove('hidden');

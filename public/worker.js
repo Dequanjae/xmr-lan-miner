@@ -10,6 +10,9 @@ let nonceStart = 0;
 let nonceEnd = 0;
 let nonceCur = 0;
 let backgroundMode = false;
+// Full dataset mode: 2-5x faster hashing but takes ~10 min to initialize
+// Light mode: instant start, slower per-hash
+let fullMode = false;
 
 function post(type, extra = {}) { postMessage({ type, ...extra }); }
 
@@ -64,8 +67,9 @@ async function mineLoop() {
 
     const t0 = Date.now();
     let hashes = 0;
-    // Background mode: shorter batches + longer yields so browser stays responsive
-    const batchMs = backgroundMode ? 500 : 2000;
+    // No capping — all workers run. Just yield occasionally so the OS can schedule other tabs.
+    // Background mode uses slightly longer yields (50ms vs 0ms) for smoother multitasking.
+    const batchMs = 2000;
     const yieldMs = backgroundMode ? 50 : 0;
 
     while (Date.now() - t0 < batchMs && mining && currentJob === job) {
@@ -130,6 +134,8 @@ self.onmessage = async (e) => {
       nonceCur = msg.start;
     } else if (msg.type === 'background') {
       backgroundMode = msg.enabled;
+    } else if (msg.type === 'fullMode') {
+      fullMode = msg.enabled;
     }
   } catch (err) {
     console.error('[worker JIT] FATAL:', err.message, err.stack);
