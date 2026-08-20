@@ -1,15 +1,16 @@
-// Worker: receives shared cache from main thread, creates own VM, mines
+// RandomX JIT mining worker — non-shared, per-worker cache + module caching
 importScripts('randomx_fast.js');
 
+let M = null;
 let vmExports = null;
 let scratch = null;
 let jitImports = null;
 let mining = false;
 let currentJob = null;
-let nonceStart = 0, nonceEnd = 0, nonceCur = 0;
-let backgroundMode = false;
 let initialized = false;
 let pendingJob = null;
+let nonceStart = 0, nonceEnd = 0, nonceCur = 0;
+let backgroundMode = false;
 
 function post(type, extra = {}) { postMessage({ type, ...extra }); }
 
@@ -39,36 +40,21 @@ function hex2target(hex) {
   return 0n;
 }
 
-self.onmessage = async (e) => {
-  const msg = e.data;
-  try {
-    if (msg.type === 'setup') {
-      post('status', { message: 'Setting up JIT VM (shared cache)...' });
-      await initWorkerVM(msg.datasetMemory, msg.thunkBytes, msg.vmWasmBytes, msg.feature);
-      initialized = true;
-      post('ready');
-    } else if (msg.type === 'reinitCache') {
-      reinitThunk(msg.datasetMemory, msg.thunkBytes);
-      post('status', { message: 'Cache reinitialized for new seed' });
-    } else if (msg.type === 'job') {
-      if (!initialized) { pendingJob = msg.job; return; }
-      currentJob = msg.job;
-    } else if (msg.type === 'start') {
-      if (!mining) { mining = true; mineLoop(); }
-    } else if (msg.type === 'stop') {
-      mining = false;
-    } else if (msg.type === 'nonceRange') {
-      nonceStart = msg.start;
-      nonceEnd = msg.end;
-      nonceCur = msg.start;
-    } else if (msg.type === 'background') {
-      backgroundMode = msg.enabled;
-    }
-  } catch (err) {
-    console.error('[worker] FATAL:', err.message, err.stack);
-    post('error', { message: err.message });
-  }
-};
+async function initEngine(seedHashHex) {
+  post('status', { message: 'Loading JIT RandomX engine...' });
+  const baseUrl = self.location.href.replace(/worker\.js.*$/, '').replace(/\?.*$/, '');
+  M = await createRandomXFast((f) => baseUrl + f);
+  vmExports = M._vmExports;
+  scratch = M._scratch;
+  jitImports = M._jitImports;
+  post('status', { message: 'JIT engine loaded, building cache (Argon2)...' });
+  post('initProgress', { phase: 'cache', progress: 10 });
+  const seed = hexToU8(seedHashHex);
+  M.initCache(seed);
+  jitImports = M._jitImports;
+  post('initProgress', { phase: 'done', progress: 100 });
+  post('status', { message: 'Cache ready (JIT mining mode + module cache)' });
+}
 
 async function mineLoop() {
   while (mining) {
@@ -108,9 +94,8 @@ async function mineLoop() {
           continue;
         }
 
-        const jitWm = new WebAssembly.Module(scratch.subarray(0, jitSize));
-        const jitWi = new WebAssembly.Instance(jitWm, jitImports);
-        jitWi.exports.d();
+        // Use cached module compilation — skips recompilation for repeated programs
+        M.executeJitProgram(jitSize);
       }
 
       const hashCount = vmExports.h();
@@ -121,3 +106,36 @@ async function mineLoop() {
     }
   }
 }
+
+self.onmessage = async (e) => {
+  const msg = e.data;
+  try {
+    if (msg.type === 'init') {
+      await initEngine(msg.seedHash);
+      initialized = true;
+      post('ready');
+      if (pendingJob) { currentJob = pendingJob; pendingJob = null; }
+    } else if (msg.type === 'job') {
+      if (!initialized) { pendingJob = msg.job; return; }
+      const oldSeed = currentJob ? currentJob.seed_hash : null;
+      currentJob = msg.job;
+      if (oldSeed !== msg.job.seed_hash && oldSeed !== null) {
+        const seed = hexToU8(msg.job.seed_hash);
+        M.initCache(seed);
+        jitImports = M._jitImports;
+        post('status', { message: 'Cache reinitialized for new seed' });
+      }
+    } else if (msg.type === 'start') {
+      if (!mining) { mining = true; mineLoop(); }
+    } else if (msg.type === 'stop') {
+      mining = false;
+    } else if (msg.type === 'nonceRange') {
+      nonceStart = msg.start; nonceEnd = msg.end; nonceCur = msg.start;
+    } else if (msg.type === 'background') {
+      backgroundMode = msg.enabled;
+    }
+  } catch (err) {
+    console.error('[worker] FATAL:', err.message, err.stack);
+    post('error', { message: err.message });
+  }
+};
