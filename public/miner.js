@@ -156,7 +156,7 @@
     showProgress(5, 'Loading WASM modules...');
 
     // Load WASM files
-    const baseUrl = location.origin + '/';
+    const baseUrl = location.href.replace(/\?.*$/, '').replace(/\/[^\/]*$/, '/');
     const [datasetWasm, vmWasm, fmaWasm, simdWasm] = await Promise.all([
       fetch(baseUrl + 'dataset.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
       fetch(baseUrl + 'vm.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
@@ -177,7 +177,7 @@
     // Spawn workers — each gets the shared memory + thunk bytes + VM wasm
     const range = Math.floor(0xffffffff / numWorkers);
     for (let i = 0; i < numWorkers; i++) {
-      const w = new Worker('worker.js');
+      const w = new Worker(baseUrl + 'worker.js');
       const start = i * range;
       const end = (i === numWorkers - 1) ? 0xffffffff : start + range;
 
@@ -231,7 +231,7 @@
   async function rebuildCache(job) {
     log('Seed changed — rebuilding shared cache...');
     showProgress(10, 'Rebuilding cache for new seed...');
-    const baseUrl = location.origin + '/';
+    const baseUrl = location.href.replace(/\?.*$/, '').replace(/\/[^\/]*$/, '/');
     const [datasetWasm, vmWasm, fmaWasm, simdWasm] = await Promise.all([
       fetch(baseUrl + 'dataset.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
       fetch(baseUrl + 'vm.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
