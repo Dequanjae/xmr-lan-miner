@@ -1,21 +1,19 @@
-// RandomX JIT mining worker — uses l1mey112 mining VM (B/Rm/n/h exports)
-// The nonce loop runs INSIDE the WASM — much faster than JS-level iteration
+// RandomX JIT mining worker — shared cache architecture
+// Main thread builds cache once → sends shared memory + thunk to all workers
+// Each worker creates own VM (2MB) + mines independently
+
 importScripts('randomx_fast.js');
 
-let M = null;
+let vmExports = null;
+let scratch = null;
+let jitImports = null;
 let mining = false;
 let currentJob = null;
-let initDone = false;
-let pendingJob = null;
 let nonceStart = 0;
 let nonceEnd = 0;
 let nonceCur = 0;
 let backgroundMode = false;
-
-// Access to the raw VM exports from the JIT engine
-let vmExports = null;
-let scratch = null;
-let jitImports = null;
+let initialized = false;
 
 function post(type, extra = {}) { postMessage({ type, ...extra }); }
 
@@ -30,148 +28,36 @@ function bufToHex(u8) {
   return Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function initEngine(seedHashHex) {
-  post('status', { message: 'Loading JIT RandomX engine...' });
-  const baseUrl = self.location.href.replace(/worker\.js.*$/, '');
-  M = await createRandomXFast((f) => baseUrl + f);
-  
-  // Access the internal VM exports that randomx_fast.js set up
-  vmExports = M._vmExports;
-  scratch = M._scratch;
-  jitImports = M._jitImports;
-  
-  post('status', { message: 'JIT engine loaded, building cache (Argon2)...' });
-  post('initProgress', { phase: 'cache', progress: 10 });
-  
-  const seed = hexToU8(seedHashHex);
-  M.initCache(seed);
-  
-  // After initCache, jitImports is updated with the new thunk
-  jitImports = M._jitImports;
-  
-  post('initProgress', { phase: 'done', progress: 100 });
-  post('status', { message: 'Cache ready (JIT mining mode)' });
-}
-
-async function mineLoop() {
-  while (mining) {
-    if (!currentJob || !M || !vmExports) { 
-      await new Promise(r => setTimeout(r, 100)); 
-      continue; 
-    }
-    
-    const job = currentJob;
-    
-    // Use the mining VM: B() sets up blob + target + nonce range
-    // Then Rm() runs the internal loop, returning 1 when share found, 0 when exhausted
-    scratch.set(hexToU8(job.blob));
-    
-    // B(blob_length, target, nonce_start, nonce_end) — target as BigInt
-    // Must match l1mey112's hex2target exactly
-    const targetHex = job.target;
-    const tBytes = hexToU8(targetHex);
-    let targetBigInt;
-    if (tBytes.length === 4) {
-      // 4-byte LE target → convert to 64-bit difficulty target
-      const u32 = new Uint32Array(tBytes.buffer)[0];
-      targetBigInt = 0xFFFFFFFFFFFFFFFFn / (0xFFFFFFFFn / BigInt(u32));
-    } else if (tBytes.length === 8) {
-      const u64 = new BigUint64Array(tBytes.buffer)[0];
-      targetBigInt = u64;
-    } else {
-      // Fallback: treat as large number
-      targetBigInt = 0n;
-      for (let i = tBytes.length - 1; i >= 0; i--) {
-        targetBigInt = (targetBigInt << 8n) | BigInt(tBytes[i]);
-      }
-    }
-    
-    vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
-    
-    post('status', { message: `Mining job ${job.job_id} nonce [${nonceStart}, ${nonceEnd})` });
-    
-    let lastHashCount = 0;
-    const t0 = Date.now();
-    
-    // Mining loop — Rm() returns:
-    //   0 = nonce space exhausted
-    //   1 = share found (get nonce via n(), hash via scratch)
-    //   >1 = JIT bytecode size — compile and execute, then call Rm() again
-    // Small batches: each WebAssembly.Instance allocates executable memory.
-    // Too many instances before GC = "out of memory". 128 iterations per batch
-    // with 0ms yield gives GC room without killing throughput.
-    const BATCH = 128;
-    
-    while (mining && currentJob === job) {
-      for (let iter = 0; iter < BATCH; iter++) {
-        const jitSize = vmExports.Rm();
-        
-        if (jitSize === 0) {
-          vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
-          continue;
-        }
-        
-        if (jitSize === 1) {
-          const nonce = Number(vmExports.n());
-          const hash = new Uint8Array(scratch.slice(0, 32));
-          post('share', {
-            jobId: job.job_id,
-            nonce: nonce.toString(16).padStart(8, '0'),
-            result: bufToHex(hash),
-          });
-          vmExports.B(job.blob.length, targetBigInt, nonceStart, nonceEnd);
-          break;
-        }
-        
-        // Compile and execute JIT program
-        const jitWm = new WebAssembly.Module(scratch.subarray(0, jitSize));
-        const jitWi = new WebAssembly.Instance(jitWm, jitImports);
-        jitWi.exports.d();
-      }
-      
-      // Report hashrate
-      const hashCount = vmExports.h();
-      const elapsed = (Date.now() - t0) / 1000;
-      post('hashrate', { hashrate: Math.round(hashCount / Math.max(elapsed, 0.001)) });
-      
-      // Yield — let GC free old WebAssembly instances
-      // Use 0ms yield (just releases to event loop) — GC runs in microtask gaps
-      await new Promise(r => setTimeout(r, 0));
-    }
-    
-    const elapsed = (Date.now() - t0) / 1000;
-    const finalHashCount = vmExports.h();
-    if (finalHashCount > 0) {
-      post('hashrate', { hashrate: Math.round(finalHashCount / Math.max(elapsed, 0.001)) });
-    }
+function hex2target(hex) {
+  const bin = hexToU8(hex);
+  if (bin.length === 4) {
+    const buf = new ArrayBuffer(4);
+    new Uint8Array(buf).set(bin);
+    const u32 = new Uint32Array(buf)[0];
+    return 0xFFFFFFFFFFFFFFFFn / (0xFFFFFFFFn / BigInt(u32));
+  } else if (bin.length === 8) {
+    const buf = new ArrayBuffer(8);
+    new Uint8Array(buf).set(bin);
+    return new BigUint64Array(buf)[0];
   }
+  return 0n;
 }
 
 self.onmessage = async (e) => {
   const msg = e.data;
   try {
-    if (msg.type === 'init') {
-      await initEngine(msg.seedHash);
-      initDone = true;
+    if (msg.type === 'setup') {
+      // Main thread sends: shared dataset memory + thunk bytes + VM wasm bytes + feature
+      post('status', { message: 'Setting up JIT VM...' });
+      await initWorkerVM(msg.datasetMemory, msg.thunkBytes, msg.vmWasmBytes, msg.feature);
+      initialized = true;
       post('ready');
-      if (pendingJob) {
-        currentJob = pendingJob;
-        pendingJob = null;
-      }
+    } else if (msg.type === 'reinitCache') {
+      // New seed — main thread sends new thunk bytes + shared memory
+      reinitThunk(msg.datasetMemory, msg.thunkBytes);
+      post('status', { message: 'Cache reinitialized for new seed' });
     } else if (msg.type === 'job') {
-      if (!initDone) {
-        pendingJob = msg.job;
-        return;
-      }
-      // Only reinit cache if the seed actually changed
-      const oldSeed = currentJob ? currentJob.seed_hash : null;
       currentJob = msg.job;
-      if (oldSeed !== msg.job.seed_hash && oldSeed !== null) {
-        const seed = hexToU8(msg.job.seed_hash);
-        M.initCache(seed);
-        jitImports = M._jitImports;
-        post('status', { message: 'Cache reinitialized for new seed' });
-      }
     } else if (msg.type === 'start') {
       if (!mining) { mining = true; mineLoop(); }
     } else if (msg.type === 'stop') {
@@ -184,7 +70,65 @@ self.onmessage = async (e) => {
       backgroundMode = msg.enabled;
     }
   } catch (err) {
-    console.error('[worker JIT miner] FATAL:', err.message, err.stack);
+    console.error('[worker] FATAL:', err.message, err.stack);
     post('error', { message: err.message });
   }
 };
+
+async function mineLoop() {
+  while (mining) {
+    if (!currentJob || !initialized || !vmExports) {
+      await new Promise(r => setTimeout(r, 100));
+      continue;
+    }
+
+    const job = currentJob;
+    const blob = hexToU8(job.blob);
+    const targetBigInt = hex2target(job.target);
+
+    // Set up mining job in VM
+    scratch.set(blob);
+    vmExports.B(blob.length, targetBigInt, nonceStart, nonceEnd);
+
+    const t0 = Date.now();
+    const BATCH = 128;
+
+    while (mining && currentJob === job) {
+      for (let iter = 0; iter < BATCH; iter++) {
+        const jitSize = vmExports.Rm();
+
+        if (jitSize === 0) {
+          // Nonce space exhausted — wrap
+          vmExports.B(blob.length, targetBigInt, nonceStart, nonceEnd);
+          continue;
+        }
+
+        if (jitSize === 1) {
+          // Share found!
+          const nonce = Number(vmExports.n());
+          const hash = new Uint8Array(scratch.slice(0, 32));
+          post('share', {
+            jobId: job.job_id,
+            nonce: nonce.toString(16).padStart(8, '0'),
+            result: bufToHex(hash),
+          });
+          vmExports.B(blob.length, targetBigInt, nonceStart, nonceEnd);
+          continue;
+        }
+
+        // Compile and execute JIT program
+        const jitWm = new WebAssembly.Module(scratch.subarray(0, jitSize));
+        const jitWi = new WebAssembly.Instance(jitWm, jitImports);
+        jitWi.exports.d();
+      }
+
+      // Report hashrate
+      const hashCount = vmExports.h();
+      const elapsed = (Date.now() - t0) / 1000;
+      post('hashrate', { hashrate: Math.round(hashCount / Math.max(elapsed, 0.001)) });
+
+      // Yield for GC
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+}

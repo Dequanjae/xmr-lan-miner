@@ -1,10 +1,10 @@
-// randomx_fast.js — standalone JIT-accelerated RandomX for browser workers
-// Based on l1mey112/randomx.js architecture, rewritten as pure JS (no TS/bun/bundler)
+// randomx_fast.js — JIT RandomX engine with shared memory support
+// Main thread: builds cache + thunk (one-time, shared across all workers)
+// Workers: receive shared memory + thunk, create own VM, mine
 
-const WASM_PAGES = 4098; // from configuration.toml / vm.wasm import
+const WASM_PAGES = 4098; // dataset memory pages
 const SCRATCH_SIZE = 16 * 1024;
 
-// JIT feature detection
 const JIT_BASELINE = 0;
 const JIT_RELAXED_SIMD = 1;
 const JIT_FMA = 2;
@@ -12,181 +12,119 @@ const JIT_FMA = 2;
 let _feature = JIT_BASELINE;
 
 async function detectFeature(fmaWasmBytes, simdWasmBytes) {
-  // Validate SIMD baseline
-  try {
-    WebAssembly.validate(simdWasmBytes);
-  } catch (e) {
-    throw new Error('WASM SIMD not supported');
-  }
+  try { WebAssembly.validate(simdWasmBytes); } catch (e) { throw new Error('WASM SIMD not supported'); }
   try {
     const wm = new WebAssembly.Module(fmaWasmBytes);
     const wi = new WebAssembly.Instance(wm);
-    if (wi.exports.d()()) {
-      _feature = JIT_FMA | JIT_RELAXED_SIMD;
-    } else {
-      _feature = JIT_RELAXED_SIMD;
-    }
-  } catch (e) {
-    _feature = JIT_BASELINE;
-  }
+    _feature = wi.exports.d()() ? (JIT_FMA | JIT_RELAXED_SIMD) : JIT_RELAXED_SIMD;
+  } catch (e) { _feature = JIT_BASELINE; }
   return _feature;
 }
 
-// Module state
-let _memory = null;
-let _datasetExports = null;  // dataset.wasm: c(), K()
-let _vmExports = null;        // vm.wasm: i(), I(), H(), Rs(), Rm()
-let _scratch = null;          // Uint8Array view into scratch buffer
-let _jitImports = null;       // imports for JIT modules: { e: { m: memory, d: superscalarhash } }
+// ---- Main thread: build shared cache ----
+// Returns { sharedMemory, thunkModule, feature } to be sent to workers
 
-async function initRandomX(datasetWasmBytes, vmWasmBytes, fmaWasmBytes, simdWasmBytes) {
-  // 1. Detect JIT features
+async function buildSharedCache(datasetWasmBytes, vmWasmBytes, fmaWasmBytes, simdWasmBytes, keyBytes) {
   await detectFeature(fmaWasmBytes, simdWasmBytes);
 
-  // 2. Create separate memories — vm.wasm needs 33 pages, dataset.wasm needs 4098
-  const vmMemory = new WebAssembly.Memory({ initial: 33, maximum: 33 });
-  const datasetMemory = new WebAssembly.Memory({ initial: 4098, maximum: 4098 });
+  // Create SHARED dataset memory — can be transferred to workers via postMessage
+  const datasetMemory = new WebAssembly.Memory({ 
+    initial: WASM_PAGES, maximum: WASM_PAGES, shared: true 
+  });
 
-  // 3. Instantiate dataset.wasm with dataset memory
+  // Instantiate dataset.wasm with shared memory
   const datasetModule = new WebAssembly.Module(datasetWasmBytes);
   const datasetInstance = new WebAssembly.Instance(datasetModule, {
     env: { memory: datasetMemory },
   });
-  _datasetExports = datasetInstance.exports;
+  const datasetExports = datasetInstance.exports;
 
-  // 4. Instantiate vm.wasm with vm memory
+  // Init cache with key
+  if (keyBytes.length > 60) throw new Error('Key too long (max 60 bytes)');
+  const jitBegin = datasetExports.c(WASM_PAGES, true); // shared=true
+  const keyBuf = new Uint8Array(datasetMemory.buffer, jitBegin, 60);
+  keyBuf.set(keyBytes);
+  const jitSize = datasetExports.K(keyBytes.length);
+  const jitBuffer = new Uint8Array(datasetMemory.buffer, jitBegin, jitSize);
+
+  // Create thunk module from JIT bytecode
+  const thunkModule = new WebAssembly.Module(jitBuffer);
+  const thunkInstance = new WebAssembly.Instance(thunkModule, {
+    e: { m: datasetMemory },
+  });
+  const superscalarHash = thunkInstance.exports.d;
+
+  // Serialize thunk module to bytes so it can be sent to workers
+  // WebAssembly.Module can't be postMessage'd directly, but we can recompile from bytes
+  // Actually — we need to send the thunk bytes, not the module
+  // Workers will recompile it themselves
+
+  return {
+    datasetMemory,      // SharedArrayBuffer-backed — transferable
+    thunkBytes: jitBuffer.slice(0), // copy of JIT bytecode
+    feature: _feature,
+    datasetExports,     // only used by main thread for re-init
+    superscalarHash,     // only used by reference, workers make their own
+  };
+}
+
+// ---- Worker: create VM and mine ----
+// Workers receive: { datasetMemory, thunkBytes, vmWasmBytes, feature, seedHash }
+
+let _vmExports = null;
+let _scratch = null;
+let _jitImports = null;
+let _vmMemory = null;
+let _datasetMemory = null;
+
+async function initWorkerVM(datasetMemory, thunkBytes, vmWasmBytes, feature) {
+  _datasetMemory = datasetMemory;
+
+  // Create per-worker VM memory (non-shared, 33 pages)
+  _vmMemory = new WebAssembly.Memory({ initial: 33, maximum: 33 });
+
+  // Instantiate VM
   const vmModule = new WebAssembly.Module(vmWasmBytes);
   const vmInstance = new WebAssembly.Instance(vmModule, {
-    env: { memory: vmMemory },
+    env: { memory: _vmMemory },
   });
   _vmExports = vmInstance.exports;
 
-  // 5. Get scratch buffer pointer from VM init
-  const scratchPtr = _vmExports.i(_feature);
-  _scratch = new Uint8Array(vmMemory.buffer, scratchPtr, SCRATCH_SIZE);
-  _memory = vmMemory; // store VM memory for reference
-  _datasetMemory = datasetMemory; // store dataset memory
-}
+  // Get scratch buffer
+  const scratchPtr = _vmExports.i(feature);
+  _scratch = new Uint8Array(_vmMemory.buffer, scratchPtr, SCRATCH_SIZE);
 
-function initCache(keyBytes) {
-  if (keyBytes.length > 60) throw new Error('Key too long (max 60 bytes)');
-
-  // Allocate JIT code buffer in dataset memory
-  // is_shared=false for non-shared build (pkg-randomx.js, not pkg-randomx.js-shared)
-  const jitBegin = _datasetExports.c(4098, false);
-
-  // Write key
-  const keyBuf = new Uint8Array(_datasetMemory.buffer, jitBegin, 60);
-  keyBuf.set(keyBytes);
-
-  // Generate JIT bytecode (long blocking call — Argon2 + superscalar)
-  const jitSize = _datasetExports.K(keyBytes.length);
-  const jitBuffer = new Uint8Array(_datasetMemory.buffer, jitBegin, jitSize);
-
-  // Create the superscalar hash thunk module from JIT bytecode
-  const thunkModule = new WebAssembly.Module(jitBuffer);
+  // Create thunk instance (worker's own, using shared dataset memory)
+  const thunkModule = new WebAssembly.Module(thunkBytes);
   const thunkInstance = new WebAssembly.Instance(thunkModule, {
     e: { m: _datasetMemory },
   });
   const superscalarHash = thunkInstance.exports.d;
 
-  // Set up JIT imports for VM-generated JIT modules
-  // JIT modules import e.m (memory) and e.d (superscalar hash)
-  // e.m must be the VM's memory (where the scratchpad lives), NOT the dataset memory
+  // JIT imports — VM memory (per-worker) + superscalar hash (shared thunk)
   _jitImports = {
     e: {
-      m: _memory,
+      m: _vmMemory,
       d: superscalarHash,
     },
   };
 }
 
-function calculateHash(input) {
-  if (typeof input === 'string') {
-    input = new TextEncoder().encode(input);
+// Reinit thunk for new seed — keeps VM memory, just updates the superscalar hash
+function reinitThunk(datasetMemory, thunkBytes) {
+  const thunkModule = new WebAssembly.Module(thunkBytes);
+  const thunkInstance = new WebAssembly.Instance(thunkModule, {
+    e: { m: datasetMemory },
+  });
+  if (_jitImports) {
+    _jitImports.e.d = thunkInstance.exports.d;
   }
-
-  // Install input
-  _vmExports.I(false);
-  if (input.length <= SCRATCH_SIZE) {
-    _scratch.set(input);
-    _vmExports.H(input.length);
-  } else {
-    let p = 0;
-    while (p < input.length) {
-      const chunk = input.subarray(p, p + SCRATCH_SIZE);
-      p += SCRATCH_SIZE;
-      _scratch.set(chunk);
-      _vmExports.H(chunk.length);
-    }
-  }
-
-  // Run VM — it generates JIT WASM programs and we compile+execute them
-  while (true) {
-    const jitSize = _vmExports.Rs();
-    if (jitSize === 0) break;
-
-    const jitWm = new WebAssembly.Module(_scratch.subarray(0, jitSize));
-    const jitWi = new WebAssembly.Instance(jitWm, _jitImports);
-    jitWi.exports.d();
-  }
-
-  // Read 32-byte hash from scratch
-  return new Uint8Array(_scratch.subarray(0, 32));
-}
-
-function calculateHexHash(input) {
-  if (typeof input === 'string') {
-    input = new TextEncoder().encode(input);
-  }
-
-  _vmExports.I(true);
-  if (input.length <= SCRATCH_SIZE) {
-    _scratch.set(input);
-    _vmExports.H(input.length);
-  } else {
-    let p = 0;
-    while (p < input.length) {
-      const chunk = input.subarray(p, p + SCRATCH_SIZE);
-      p += SCRATCH_SIZE;
-      _scratch.set(chunk);
-      _vmExports.H(chunk.length);
-    }
-  }
-
-  while (true) {
-    const jitSize = _vmExports.Rs();
-    if (jitSize === 0) break;
-    const jitWm = new WebAssembly.Module(_scratch.subarray(0, jitSize));
-    const jitWi = new WebAssembly.Instance(jitWm, _jitImports);
-    jitWi.exports.d();
-  }
-
-  return new TextDecoder().decode(_scratch.subarray(0, 64));
 }
 
 // Export for both CommonJS and browser
-if (typeof module !== 'undefined') module.exports = { createRandomXFast };
-if (typeof self !== 'undefined') self.createRandomXFast = createRandomXFast;
-
-async function createRandomXFast(locateFile) {
-  const [datasetWasm, vmWasm, fmaWasm, simdWasm] = await Promise.all([
-    fetch(locateFile('dataset.wasm')).then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-    fetch(locateFile('vm.wasm')).then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-    fetch(locateFile('fma.wasm')).then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-    fetch(locateFile('simd.wasm')).then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
-  ]);
-
-  await initRandomX(datasetWasm, vmWasm, fmaWasm, simdWasm);
-
-  return {
-    initCache,
-    calculateHash,
-    calculateHexHash,
-    feature: _feature,
-    // Expose internals for mining VM mode
-    get _vmExports() { return _vmExports; },
-    get _scratch() { return _scratch; },
-    get _jitImports() { return _jitImports; },
-  };
+if (typeof module !== 'undefined') module.exports = { buildSharedCache, initWorkerVM, detectFeature };
+if (typeof self !== 'undefined') {
+  self.buildSharedCache = buildSharedCache;
+  self.initWorkerVM = initWorkerVM;
+  self.detectFeature = detectFeature;
 }

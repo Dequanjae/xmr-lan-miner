@@ -1,4 +1,4 @@
-// Main thread: manage worker pool, WS to proxy, submit shares, system info, auto-start
+// Main thread: build shared cache once → send to all workers → manage mining
 (() => {
   let ws = null;
   let workers = [];
@@ -9,10 +9,10 @@
   let accepted = 0, rejected = 0;
   let totalHashrate = 0;
   let cores = navigator.hardwareConcurrency || 4;
-  // Cap at 8 by default — each worker loads its own WASM + 256MB cache.
-  // Too many workers = executable memory exhaustion in Firefox.
-  let numWorkers = Math.min(cores - 1, 8);
+  let numWorkers = Math.min(cores - 1, 16); // shared memory = more workers OK
   let backgroundMode = false;
+  let sharedCacheReady = false;
+  let pendingJobs = [];
 
   const $ = (id) => document.getElementById(id);
   const safeSet = (id, val) => { const el = $(id); if (el) el.textContent = val; };
@@ -44,25 +44,23 @@
 
   async function loadConfig() {
     const qp = new URLSearchParams(location.search);
-    // Query param wallet overrides localStorage overrides server default
     const savedWallet = localStorage.getItem('xmr-wallet') || '';
     try {
       const r = await fetch('/config');
       const c = await r.json();
       $('walletInput').value = qp.get('wallet') || savedWallet || c.wallet || '';
-      $('poolHost').value = qp.get('pool') || qp.get('poolHost') || c.poolHost || '';
-      $('poolPort').value = qp.get('port') || qp.get('poolPort') || c.poolPort || 3333;
+      $('poolHost').value = qp.get('pool') || c.poolHost || '';
+      $('poolPort').value = qp.get('port') || c.poolPort || 3333;
     } catch (e) {
       $('walletInput').value = qp.get('wallet') || savedWallet || '';
       $('poolHost').value = qp.get('pool') || 'pool.supportxmr.com';
       $('poolPort').value = qp.get('port') || 3333;
     }
-    // Load saved preferences
     backgroundMode = localStorage.getItem('xmr-background') === '1';
     const bgCheckbox = $('backgroundMode');
     if (bgCheckbox) bgCheckbox.checked = backgroundMode;
     const savedWorkers = localStorage.getItem('xmr-workers');
-    if (savedWorkers) numWorkers = parseInt(savedWorkers, 10) || numWorkers;
+    if (savedWorkers) numWorkers = Math.min(parseInt(savedWorkers, 10) || numWorkers, 16);
   }
 
   function renderSystemInfo() {
@@ -73,12 +71,12 @@
     safeSet('sysMode', 'JIT');
     const slider = $('workerCount');
     if (slider) {
-      slider.max = Math.min(cores, 8);
+      slider.max = Math.min(cores, 16);
       slider.value = numWorkers;
       const disp = $('workerCountDisplay');
       if (disp) disp.textContent = numWorkers;
       const mc = $('maxCores');
-      if (mc) mc.textContent = cores;
+      if (mc) mc.textContent = Math.min(cores, 16);
     }
     return sys;
   }
@@ -137,55 +135,69 @@
 
   function onNewJob(job) {
     const wasFirstJob = !currentJob;
+    const seedChanged = currentJob && currentJob.seed_hash !== job.seed_hash;
     currentJob = job;
     log(`New job id=${job.job_id} seed=${job.seed_hash?.slice(0, 12)}... target=${job.target}`);
-    if (workers.length === 0) return;
-    if (wasFirstJob) {
-      for (const w of workers) w.postMessage({ type: 'init', seedHash: job.seed_hash });
+
+    if (wasFirstJob && !sharedCacheReady) {
+      // First job — build shared cache, then start workers
+      startSharedMining(job);
+    } else if (seedChanged) {
+      // Seed changed — rebuild cache, send new thunk to workers
+      rebuildCache(job);
     } else {
+      // Same seed — just send new job to workers
       for (const w of workers) w.postMessage({ type: 'job', job });
     }
   }
 
-  function startWorkers() {
-    const n = numWorkers;
-    const range = Math.floor(0xffffffff / n);
-    for (let i = 0; i < n; i++) {
+  async function startSharedMining(job) {
+    log('Building shared JIT cache (one-time, ~3-5s)...');
+    showProgress(5, 'Loading WASM modules...');
+
+    // Load WASM files
+    const baseUrl = location.origin + '/';
+    const [datasetWasm, vmWasm, fmaWasm, simdWasm] = await Promise.all([
+      fetch(baseUrl + 'dataset.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch(baseUrl + 'vm.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch(baseUrl + 'fma.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch(baseUrl + 'simd.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+    ]);
+
+    showProgress(15, 'Building Argon2 cache + superscalar JIT...');
+
+    // Build shared cache from seed hash
+    const seed = hexToU8(job.seed_hash);
+    const cache = await buildSharedCache(datasetWasm, vmWasm, fmaWasm, simdWasm, seed);
+
+    showProgress(80, 'Starting workers...');
+
+    sharedCacheReady = true;
+
+    // Spawn workers — each gets the shared memory + thunk bytes + VM wasm
+    const range = Math.floor(0xffffffff / numWorkers);
+    for (let i = 0; i < numWorkers; i++) {
       const w = new Worker('worker.js');
       const start = i * range;
-      const end = (i === n - 1) ? 0xffffffff : start + range;
+      const end = (i === numWorkers - 1) ? 0xffffffff : start + range;
+
+      w.postMessage({
+        type: 'setup',
+        datasetMemory: cache.datasetMemory,
+        thunkBytes: cache.thunkBytes,
+        vmWasmBytes: vmWasm,
+        feature: cache.feature,
+      });
       w.postMessage({ type: 'nonceRange', start, end });
       w.postMessage({ type: 'background', enabled: backgroundMode });
+      w.postMessage({ type: 'job', job });
 
       w.onmessage = (e) => {
         const m = e.data;
         if (m.type === 'status') log(m.message);
         else if (m.type === 'error') log(`Worker ${i}: ${m.message}`, 'err');
-        else if (m.type === 'initProgress') {
-          // Track per-worker init progress
-          w._initProgress = m.progress;
-          // Show progress bar
-          const bar = $('initProgress');
-          if (bar) bar.classList.remove('hidden');
-          // Aggregate: average across all workers
-          const totalProgress = workers.reduce((s, w2) => s + (w2._initProgress || 0), 0) / workers.length;
-          const pct = Math.round(totalProgress);
-          const barEl = $('initBar');
-          const pctEl = $('initPercent');
-          const detailEl = $('initDetail');
-          if (barEl) barEl.style.width = pct + '%';
-          if (pctEl) pctEl.textContent = pct + '%';
-          if (detailEl) {
-            const ready = workers.filter(w2 => (w2._initProgress || 0) >= 100).length;
-            detailEl.textContent = `${ready}/${workers.length} workers ready`;
-          }
-          if (pct >= 100) {
-            setTimeout(() => { if (bar) bar.classList.add('hidden'); }, 2000);
-          }
-        }
         else if (m.type === 'ready') {
-          log(`Worker ${i} ready (JIT) — mining!`);
-          // Worker is ready and already has the job from pendingJob — just start
+          log(`Worker ${i} ready (shared JIT) — mining!`);
           w.postMessage({ type: 'start' });
         }
         else if (m.type === 'hashrate') {
@@ -193,7 +205,7 @@
           totalHashrate = workers.reduce((s, w2) => s + (w2._hashrate || 0), 0);
           safeSet('hashrate', totalHashrate + ' H/s');
           if (ws && connected) {
-            ws.send(JSON.stringify({ method: 'stats', hashrate: totalHashrate, workers: n, accepted, rejected }));
+            ws.send(JSON.stringify({ method: 'stats', hashrate: totalHashrate, workers: numWorkers, accepted, rejected }));
           }
         }
         else if (m.type === 'share') {
@@ -209,7 +221,51 @@
       w.onerror = (e) => { log(`Worker ${i} error: ${e.message}`, 'err'); };
       workers.push(w);
     }
-    log(`Started ${n} JIT workers`);
+
+    showProgress(100, `${numWorkers} workers started`);
+    safeSet('activeThreads', numWorkers);
+    setTimeout(() => { const bar = $('initProgress'); if (bar) bar.classList.add('hidden'); }, 2000);
+    log(`Started ${numWorkers} workers with shared cache`);
+  }
+
+  async function rebuildCache(job) {
+    log('Seed changed — rebuilding shared cache...');
+    showProgress(10, 'Rebuilding cache for new seed...');
+    const baseUrl = location.origin + '/';
+    const [datasetWasm, vmWasm, fmaWasm, simdWasm] = await Promise.all([
+      fetch(baseUrl + 'dataset.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch(baseUrl + 'vm.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch(baseUrl + 'fma.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+      fetch(baseUrl + 'simd.wasm').then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+    ]);
+    const seed = hexToU8(job.seed_hash);
+    const cache = await buildSharedCache(datasetWasm, vmWasm, fmaWasm, simdWasm, seed);
+    // Send new thunk to all workers
+    for (const w of workers) {
+      w.postMessage({ type: 'reinitCache', datasetMemory: cache.datasetMemory, thunkBytes: cache.thunkBytes });
+      w.postMessage({ type: 'job', job });
+    }
+    showProgress(100, 'Cache rebuilt');
+    setTimeout(() => { const bar = $('initProgress'); if (bar) bar.classList.add('hidden'); }, 2000);
+  }
+
+  function showProgress(pct, detail) {
+    const bar = $('initProgress');
+    if (bar) bar.classList.remove('hidden');
+    const barEl = $('initBar');
+    const pctEl = $('initPercent');
+    const detailEl = $('initDetail');
+    if (barEl) barEl.style.width = pct + '%';
+    if (pctEl) pctEl.textContent = pct + '%';
+    if (detailEl) detailEl.textContent = detail;
+    if (pct >= 100) setTimeout(() => { if (bar) bar.classList.add('hidden'); }, 2000);
+  }
+
+  function hexToU8(hex) {
+    const n = hex.length / 2;
+    const out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
   }
 
   window.startMining = async function () {
@@ -219,25 +275,17 @@
     if (!wallet || wallet.length < 90) { alert('Invalid XMR wallet address'); return; }
     if (!poolHost) { alert('Pool host required'); return; }
 
-    // Save wallet + prefs
     localStorage.setItem('xmr-wallet', wallet);
-    localStorage.setItem('xmr-workers', numWorkers.toString());
-
     const slider = $('workerCount');
-    if (slider) numWorkers = parseInt(slider.value, 10) || numWorkers;
+    if (slider) { numWorkers = parseInt(slider.value, 10) || numWorkers; localStorage.setItem('xmr-workers', numWorkers.toString()); }
     const bgCheckbox = $('backgroundMode');
     if (bgCheckbox) { backgroundMode = bgCheckbox.checked; localStorage.setItem('xmr-background', backgroundMode ? '1' : '0'); }
-
-    // In background mode, use fewer workers to keep the system responsive
-    const effectiveWorkers = numWorkers;
 
     $('setup').classList.add('hidden');
     $('mining').classList.remove('hidden');
     $('walletDisplay').textContent = wallet;
-    log(`Initializing ${effectiveWorkers} JIT workers${backgroundMode ? ' (background mode)' : ''}...`);
+    log('Connecting to pool...');
 
-    startWorkers();
-    safeSet('activeThreads', effectiveWorkers);
     connectWS({ wallet, poolHost, poolPort });
   };
 
@@ -255,19 +303,16 @@
     $('workerCountDisplay').textContent = val;
   };
 
-  // Auto-start: if wallet is saved, start mining on page load
   function tryAutoStart() {
     const qp = new URLSearchParams(location.search);
     const wallet = qp.get('wallet') || localStorage.getItem('xmr-wallet');
     if (wallet && wallet.length >= 90) {
       log('Auto-starting with saved wallet...');
-      // Small delay to let config load
       setTimeout(() => window.startMining(), 500);
     }
   }
 
   loadConfig();
   renderSystemInfo();
-  // Auto-start after config loads
   setTimeout(tryAutoStart, 1000);
 })();
