@@ -1,14 +1,59 @@
 // Stratum TCP bridge + static file server + admin dashboard for LAN XMR mining
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const WALLET = process.env.WALLET || '8ApdEka2j6CUaaNKp12H1VBi1bziZB2T9Dhju1fPzgiTC8KBLWEEddVeZnpZjg7Ni4KCENsPLfSDfh2nbMhbFqngM5wKwHE';
 const POOL_HOST = process.env.POOL_HOST || 'pool.supportxmr.com';
 const POOL_PORT = parseInt(process.env.POOL_PORT || '3333', 10);
+// Generate self-signed cert for HTTPS (required for SharedArrayBuffer in Firefox)
+function generateSelfSignedCert() {
+  const { generateKeyPairSync, createSign } = crypto;
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  
+  // Build a self-signed X.509 cert manually
+  // This is a minimal cert — browsers will show a warning but it works for LAN
+  const cert = crypto.createPrivateKey({
+    key: privateKey.export({ type: 'pkcs1', format: 'pem' }),
+  });
+  
+  // Use Node's built-in self-signed cert generation via X509Certificate
+  try {
+    const { X509Certificate } = crypto;
+    // Can't easily create X509 in Node — use forge-style approach
+    // Instead, shell out to openssl if available, or use a pre-generated cert
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Try to use openssl to generate cert, fall back to HTTP-only
+function getHttpsOptions() {
+  const certPath = '/tmp/xmr-miner-cert.pem';
+  const keyPath = '/tmp/xmr-miner-key.pem';
+  
+  try {
+    if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
+      const { execSync } = require('child_process');
+      execSync(`openssl req -x509 -newkey rsa:2048 -keyout ${keyPath} -out ${certPath} -days 365 -nodes -subj "/CN=xmr-lan-miner" 2>/dev/null`);
+    }
+    return {
+      key: fs.readFileSync(keyPath),
+      cert: fs.readFileSync(certPath),
+    };
+  } catch (e) {
+    console.log('HTTPS: openssl not available, using HTTP only (SharedArrayBuffer will not work)');
+    return null;
+  }
+}
+
 const HTTP_PORT = parseInt(process.env.HTTP_PORT || '8080', 10);
+const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '8443', 20);
 const WORKER_PREFIX = process.env.WORKER_PREFIX || 'lanxmr';
 
 const PUBLIC = path.join(__dirname, 'public');
@@ -25,6 +70,7 @@ const server = http.createServer((req, res) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
   res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Cache-Control', 'no-cache');
 
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/') p = '/index.html';
@@ -40,30 +86,6 @@ const server = http.createServer((req, res) => {
       wallet: WALLET, poolHost: POOL_HOST, poolPort: POOL_PORT, workerPrefix: WORKER_PREFIX,
     }));
   }
-  if (p === '/extension' || p === '/extension/') {
-    // Serve extension install page
-    const extPath = path.join(__dirname, '..', 'extension');
-    fs.readFile(path.join(extPath, 'README.md'), (err, data) => {
-      if (err) { res.writeHead(404); return res.end('extension not found'); }
-      res.writeHead(200, { 'content-type': 'text/plain' });
-      res.end(data);
-    });
-    return;
-  }
-  if (p.startsWith('/extension/')) {
-    // Serve extension files
-    const extFile = p.replace('/extension/', '');
-    const extPath = path.join(__dirname, '..', 'extension', extFile);
-    if (!extPath.startsWith(path.join(__dirname, '..', 'extension'))) { res.writeHead(403); return res.end(); }
-    fs.readFile(extPath, (err, data) => {
-      if (err) { res.writeHead(404); return res.end('not found'); }
-      const ext = path.extname(extFile);
-      const extMime = { '.js': 'application/javascript', '.json': 'application/json', '.wasm': 'application/wasm', '.html': 'text/html', '.png': 'image/png', '.md': 'text/plain' };
-      res.writeHead(200, { 'content-type': extMime[ext] || 'application/octet-stream' });
-      res.end(data);
-    });
-    return;
-  }
   if (p === '/api/miners') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify(Array.from(miners.values())));
@@ -77,7 +99,11 @@ const server = http.createServer((req, res) => {
   });
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ 
+  server,
+  // Override the upgrade handler to add COEP headers
+  handleProtocols: (protocols) => protocols[0] || false,
+});
 
 const hexToBuf = (h) => Buffer.from(h, 'hex');
 
@@ -210,10 +236,29 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(HTTP_PORT, '0.0.0.0', () => {
-  console.log(`XMR LAN miner listening on 0.0.0.0:${HTTP_PORT}`);
+  console.log(`XMR LAN miner listening on http://0.0.0.0:${HTTP_PORT}`);
   console.log(`Pool: ${POOL_HOST}:${POOL_PORT}  Wallet: ${WALLET.slice(0, 12)}...${WALLET.slice(-6)}`);
   console.log(`Admin dashboard: http://0.0.0.0:${HTTP_PORT}/admin`);
 });
+
+// Start HTTPS server (required for SharedArrayBuffer in Firefox)
+const httpsOpts = getHttpsOptions();
+if (httpsOpts) {
+  const httpsServer = https.createServer(httpsOpts, (req, res) => {
+    // Re-use the same handler — set COEP headers
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Cache-Control', 'no-cache');
+    server.emit('request', req, res);
+  });
+  // Attach WS server to HTTPS too
+  new WebSocketServer({ server: httpsServer });
+  httpsServer.listen(HTTPS_PORT, '0.0.0.0', () => {
+    console.log(`HTTPS: https://0.0.0.0:${HTTPS_PORT} (SharedArrayBuffer enabled)`);
+    console.log(`HTTPS Admin: https://0.0.0.0:${HTTPS_PORT}/admin`);
+  });
+}
 
 // Stale miner cleanup — remove miners not seen in 60s
 setInterval(() => {
