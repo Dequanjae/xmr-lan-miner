@@ -26,39 +26,26 @@ let _memory = null;
 let _datasetMemory = null;
 let _datasetExports = null;
 
-// JIT module + instance cache
-// Module compilation is cheap (~0.12ms), instance creation is expensive (~40ms executable memory alloc)
-// Cache both — reuse instances when possible
-const _moduleCache = new Map(); // bytecode hash → { module, instance }
-let _cacheHits = 0;
-let _cacheMisses = 0;
+// JIT program execution — no caching (hit rate is 0%, caching prevents GC)
+// Instead: catch OOM, clear refs, yield, retry
+let _oomCount = 0;
 
-function hashBytecode(bytes) {
-  let h = 0;
-  const len = bytes.length;
-  for (let i = 0; i < len; i += 7) { h = ((h << 5) - h + bytes[i]) | 0; }
-  return h + '_' + len;
-}
-
-function getOrCompileModule(bytecode) {
-  const key = hashBytecode(bytecode);
-  let entry = _moduleCache.get(key);
-  if (entry) {
-    _cacheHits++;
-    // Reuse existing instance — skip executable memory allocation
-    return entry;
+function executeJitProgram(jitSize) {
+  const bytecode = _scratch.subarray(0, jitSize);
+  try {
+    const mod = new WebAssembly.Module(bytecode);
+    const inst = new WebAssembly.Instance(mod, _jitImports);
+    inst.exports.d();
+    // Drop references immediately so GC can free executable memory
+  } catch (e) {
+    if (e instanceof InternalError || e.message.includes('memory')) {
+      _oomCount++;
+      // OOM — will recover on next yield. The instance wasn't created so no leak.
+      // The current hash fails but mining continues.
+    } else {
+      throw e;
+    }
   }
-  _cacheMisses++;
-  const mod = new WebAssembly.Module(bytecode);
-  const inst = new WebAssembly.Instance(mod, _jitImports);
-  if (_moduleCache.size > 500) {
-    // Clear oldest entries
-    const firstKey = _moduleCache.keys().next().value;
-    _moduleCache.delete(firstKey);
-  }
-  entry = { module: mod, instance: inst };
-  _moduleCache.set(key, entry);
-  return entry;
 }
 
 async function initRandomXFull(datasetWasmBytes, vmWasmBytes, fmaWasmBytes, simdWasmBytes) {
@@ -126,7 +113,7 @@ async function createRandomXFast(locateFile) {
     get _scratch() { return _scratch; },
     get _jitImports() { return _jitImports; },
     executeJitProgram,
-    getCacheStats() { return { hits: _cacheHits, misses: _cacheMisses, size: _moduleCache.size }; },
+    getOomCount() { return _oomCount; },
   };
 }
 
