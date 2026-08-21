@@ -29,6 +29,11 @@ const server = http.createServer((req, res) => {
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/') p = '/index.html';
   if (p === '/admin' || p === '/admin/') p = '/admin.html';
+  if (p === '/favicon.ico') {
+    // 1x1 transparent PNG — required for COEP compliance (404 without CORP breaks isolation)
+    res.writeHead(200, { 'content-type': 'image/png' });
+    return res.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64'));
+  }
   if (p === '/config') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({
