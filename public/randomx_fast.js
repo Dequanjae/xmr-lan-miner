@@ -32,19 +32,21 @@ let _oomCount = 0;
 
 function executeJitProgram(jitSize) {
   const bytecode = _scratch.subarray(0, jitSize);
+  let mod, inst;
   try {
-    const mod = new WebAssembly.Module(bytecode);
-    const inst = new WebAssembly.Instance(mod, _jitImports);
-    inst.exports.d();
-    // Drop references immediately so GC can free executable memory
+    mod = new WebAssembly.Module(bytecode);
   } catch (e) {
-    if (e instanceof InternalError || e.message.includes('memory')) {
-      _oomCount++;
-      // OOM — will recover on next yield. The instance wasn't created so no leak.
-      // The current hash fails but mining continues.
-    } else {
-      throw e;
-    }
+    // OOM during validation — skip this program
+    if (e instanceof InternalError || e.message.includes('memory')) { _oomCount++; return; }
+    throw e;
+  }
+  try {
+    inst = new WebAssembly.Instance(mod, _jitImports);
+    inst.exports.d();
+  } catch (e) {
+    // OOM during instantiation — skip
+    if (e instanceof InternalError || e.message.includes('memory')) { _oomCount++; return; }
+    throw e;
   }
 }
 
