@@ -42,7 +42,7 @@ function hex2target(hex) {
 
 async function initEngine(seedHashHex) {
   post('status', { message: 'Loading JIT RandomX engine...' });
-  const baseUrl = self.location.href.replace(/worker\.js.*$/, '').replace(/\?.*$/, '');
+    const baseUrl = self.location.href.replace(/worker\.js.*$/, '').replace(/\?.*$/, '').replace(/#.*$/, '');
   M = await createRandomXFast((f) => baseUrl + f);
   vmExports = M._vmExports;
   scratch = M._scratch;

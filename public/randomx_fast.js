@@ -25,30 +25,7 @@ let _jitImports = null;
 let _memory = null;
 let _datasetMemory = null;
 let _datasetExports = null;
-
-// JIT program execution — no caching (hit rate is 0%, caching prevents GC)
-// Instead: catch OOM, clear refs, yield, retry
 let _oomCount = 0;
-
-function executeJitProgram(jitSize) {
-  const bytecode = _scratch.subarray(0, jitSize);
-  let mod, inst;
-  try {
-    mod = new WebAssembly.Module(bytecode);
-  } catch (e) {
-    // OOM during validation — skip this program
-    if (e instanceof InternalError || e.message.includes('memory')) { _oomCount++; return; }
-    throw e;
-  }
-  try {
-    inst = new WebAssembly.Instance(mod, _jitImports);
-    inst.exports.d();
-  } catch (e) {
-    // OOM during instantiation — skip
-    if (e instanceof InternalError || e.message.includes('memory')) { _oomCount++; return; }
-    throw e;
-  }
-}
 
 async function initRandomXFull(datasetWasmBytes, vmWasmBytes, fmaWasmBytes, simdWasmBytes) {
   await detectFeature(fmaWasmBytes, simdWasmBytes);
@@ -90,12 +67,23 @@ function getVmExports() { return _vmExports; }
 function getScratch() { return _scratch; }
 function getJitImports() { return _jitImports; }
 
-// Compile and execute a JIT program with caching
-// Cached entries reuse the instance (skip executable memory allocation)
+// Compile and execute a JIT program — no caching, with OOM recovery
 function executeJitProgram(jitSize) {
   const bytecode = _scratch.subarray(0, jitSize);
-  const entry = getOrCompileModule(bytecode);
-  entry.instance.exports.d();
+  let mod, inst;
+  try {
+    mod = new WebAssembly.Module(bytecode);
+  } catch (e) {
+    if (e instanceof InternalError || e.message.includes('memory')) { _oomCount++; return; }
+    throw e;
+  }
+  try {
+    inst = new WebAssembly.Instance(mod, _jitImports);
+    inst.exports.d();
+  } catch (e) {
+    if (e instanceof InternalError || e.message.includes('memory')) { _oomCount++; return; }
+    throw e;
+  }
 }
 
 async function createRandomXFast(locateFile) {
