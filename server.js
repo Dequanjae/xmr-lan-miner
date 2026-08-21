@@ -172,6 +172,12 @@ wss.on('connection', (ws, req) => {
     miners.delete(tag);
     if (pool && !pool.destroyed) try { pool.destroy(); } catch (e) {}
   });
+
+  // Heartbeat — detect stale connections
+  ws.on('pong', () => { minerRecord.lastSeen = Date.now(); });
+
+  // Check for stale miners every 30s and clean up
+  // (prevents admin dashboard from showing dead connections)
 });
 
 server.listen(HTTP_PORT, '0.0.0.0', () => {
@@ -179,3 +185,14 @@ server.listen(HTTP_PORT, '0.0.0.0', () => {
   console.log(`Pool: ${POOL_HOST}:${POOL_PORT}  Wallet: ${WALLET.slice(0, 12)}...${WALLET.slice(-6)}`);
   console.log(`Admin dashboard: http://0.0.0.0:${HTTP_PORT}/admin`);
 });
+
+// Stale miner cleanup — remove miners not seen in 60s
+setInterval(() => {
+  const now = Date.now();
+  for (const [tag, miner] of miners) {
+    if (now - (miner.lastSeen || 0) > 60000) {
+      console.log(`[${tag}] stale — removing`);
+      miners.delete(tag);
+    }
+  }
+}, 30000);

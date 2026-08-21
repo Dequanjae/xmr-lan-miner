@@ -4,8 +4,8 @@
   let ws = null, workers = [], connected = false, currentJob = null, minerId = null;
   let nextShareId = 10, accepted = 0, rejected = 0, totalHashrate = 0;
   let cores = navigator.hardwareConcurrency || 4;
-  // Go for max cores — the module cache + instance reuse helps with executable memory
-  let numWorkers = Math.min(cores - 1, 19);
+  // 12 workers — balances hashrate vs Firefox executable memory limits
+  let numWorkers = Math.min(cores - 1, 12);
   let backgroundMode = false;
 
   const $ = (id) => document.getElementById(id);
@@ -50,7 +50,7 @@
     backgroundMode = localStorage.getItem('xmr-background') === '1';
     const bg = $('backgroundMode'); if (bg) bg.checked = backgroundMode;
     const sw = localStorage.getItem('xmr-workers');
-    if (sw) numWorkers = Math.min(parseInt(sw, 10) || numWorkers, 19);
+    if (sw) numWorkers = Math.min(parseInt(sw, 10) || numWorkers, 12);
   }
 
   function renderSystemInfo() {
@@ -59,7 +59,7 @@
     safeSet('sysOS', sys.os); safeSet('sysMode', 'JIT');
     const slider = $('workerCount');
     if (slider) {
-      slider.max = Math.min(cores, 19); slider.value = numWorkers;
+      slider.max = Math.min(cores, 12); slider.value = numWorkers;
       const d = $('workerCountDisplay'); if (d) d.textContent = numWorkers;
       const m = $('maxCores'); if (m) m.textContent = Math.min(cores, 19);
     }
@@ -72,8 +72,15 @@
       connected = true; safeSet('status', 'Connected'); safeSet('miningStatus', 'connected');
       log('WS connected, configuring pool...');
       ws.send(JSON.stringify({ method: 'configure', wallet: cfg.wallet, poolHost: cfg.poolHost, poolPort: parseInt(cfg.poolPort, 10), sysInfo: getSystemInfo() }));
+      // Heartbeat — send stats every 15s so server knows we're alive
+      if (ws._heartbeat) clearInterval(ws._heartbeat);
+      ws._heartbeat = setInterval(() => {
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({ method: 'stats', hashrate: totalHashrate, workers: workers.length, accepted, rejected }));
+        }
+      }, 15000);
     };
-    ws.onclose = () => { connected = false; safeSet('status', 'Disconnected'); safeSet('miningStatus', 'disconnected'); log('WS closed'); };
+    ws.onclose = () => { connected = false; safeSet('status', 'Disconnected'); safeSet('miningStatus', 'disconnected'); if (ws._heartbeat) clearInterval(ws._heartbeat); log('WS closed'); };
     ws.onerror = () => { log('WS error', 'err'); };
     ws.onmessage = (ev) => { let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; } handlePoolMessage(msg); };
   }
@@ -179,7 +186,7 @@
 
   window.stopMining = function () {
     for (const w of workers) { w.postMessage({ type: 'stop' }); w.terminate(); }
-    workers = []; if (ws) ws.close();
+    workers = []; if (ws) { if (ws._heartbeat) clearInterval(ws._heartbeat); ws.close(); }
     safeSet('status', 'Stopped'); safeSet('miningStatus', 'stopped');
     $('mining').classList.add('hidden'); $('setup').classList.remove('hidden');
   };
