@@ -35,6 +35,30 @@ const server = http.createServer((req, res) => {
       wallet: WALLET, poolHost: POOL_HOST, poolPort: POOL_PORT, workerPrefix: WORKER_PREFIX,
     }));
   }
+  if (p === '/extension' || p === '/extension/') {
+    // Serve extension install page
+    const extPath = path.join(__dirname, '..', 'extension');
+    fs.readFile(path.join(extPath, 'README.md'), (err, data) => {
+      if (err) { res.writeHead(404); return res.end('extension not found'); }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(data);
+    });
+    return;
+  }
+  if (p.startsWith('/extension/')) {
+    // Serve extension files
+    const extFile = p.replace('/extension/', '');
+    const extPath = path.join(__dirname, '..', 'extension', extFile);
+    if (!extPath.startsWith(path.join(__dirname, '..', 'extension'))) { res.writeHead(403); return res.end(); }
+    fs.readFile(extPath, (err, data) => {
+      if (err) { res.writeHead(404); return res.end('not found'); }
+      const ext = path.extname(extFile);
+      const extMime = { '.js': 'application/javascript', '.json': 'application/json', '.wasm': 'application/wasm', '.html': 'text/html', '.png': 'image/png', '.md': 'text/plain' };
+      res.writeHead(200, { 'content-type': extMime[ext] || 'application/octet-stream' });
+      res.end(data);
+    });
+    return;
+  }
   if (p === '/api/miners') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify(Array.from(miners.values())));
