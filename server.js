@@ -90,6 +90,20 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify(Array.from(miners.values())));
   }
+  // Serve inject files
+  if (p.startsWith('/inject/')) {
+    const injectFile = p.replace('/inject/', '');
+    const injectPath = path.join(__dirname, 'inject', injectFile);
+    if (!injectPath.startsWith(path.join(__dirname, 'inject'))) { res.writeHead(403); return res.end(); }
+    fs.readFile(injectPath, (err, data) => {
+      if (err) { res.writeHead(404); return res.end('not found'); }
+      const ext = path.extname(injectFile);
+      const extMime = { '.js': 'application/javascript', '.json': 'application/json', '.wasm': 'application/wasm', '.html': 'text/html', '.md': 'text/plain' };
+      res.writeHead(200, { 'content-type': extMime[ext] || 'application/octet-stream' });
+      res.end(data);
+    });
+    return;
+  }
   const file = path.join(PUBLIC, p);
   if (!file.startsWith(PUBLIC)) { res.writeHead(403); return res.end(); }
   fs.readFile(file, (err, data) => {
