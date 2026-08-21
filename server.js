@@ -53,7 +53,7 @@ function getHttpsOptions() {
 }
 
 const HTTP_PORT = parseInt(process.env.HTTP_PORT || '8080', 10);
-const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '8443', 20);
+const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '8443', 10);
 const WORKER_PREFIX = process.env.WORKER_PREFIX || 'lanxmr';
 
 const PUBLIC = path.join(__dirname, 'public');
